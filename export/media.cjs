@@ -1,0 +1,835 @@
+const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+const FILLER_WORDS = new Set(["um", "uh", "umm", "uhh", "erm", "hmm", "ah", "like"]);
+
+function run(cmd, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { ...options, windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout?.on("data", (d) => {
+      stdout += d.toString();
+    });
+    proc.stderr?.on("data", (d) => {
+      stderr += d.toString();
+    });
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) resolve({ stdout, stderr });
+      else reject(new Error(stderr.slice(-1200) || `ffmpeg exited ${code}`));
+    });
+  });
+}
+
+async function probeVideo(filePath) {
+  const { stdout } = await run("ffprobe", [
+    "-v",
+    "error",
+    "-show_streams",
+    "-show_entries",
+    "stream=codec_type,width,height,duration,r_frame_rate",
+    "-of",
+    "json",
+    filePath,
+  ]);
+  const data = JSON.parse(stdout || "{}");
+  const streams = data.streams || [];
+  const vstream = streams.find((stream) => stream.codec_type === "video");
+  if (!vstream) {
+    return { width: 0, height: 0, duration: 0, fps: 0, hasVideo: false };
+  }
+  const fpsParts = String(vstream.r_frame_rate || "30/1").split("/");
+  const fps = Number(fpsParts[0]) / (Number(fpsParts[1]) || 1);
+  return {
+    width: Number(vstream.width) || 0,
+    height: Number(vstream.height) || 0,
+    duration: Number(vstream.duration) || 0,
+    fps: fps || 30,
+    hasVideo: true,
+  };
+}
+
+async function extractAudio(videoPath, outDir) {
+  const outPath = path.join(outDir, "extracted.mp3");
+  await run("ffmpeg", [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    videoPath,
+    "-vn",
+    "-acodec",
+    "libmp3lame",
+    "-ar",
+    "44100",
+    "-ac",
+    "1",
+    "-b:a",
+    "128k",
+    outPath,
+  ]);
+  return outPath;
+}
+
+async function compressAudio(audioPath, outDir) {
+  const outPath = path.join(outDir, "compressed.mp3");
+  await run("ffmpeg", [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    audioPath,
+    "-acodec",
+    "libmp3lame",
+    "-ar",
+    "16000",
+    "-ac",
+    "1",
+    "-b:a",
+    "64k",
+    outPath,
+  ]);
+  return outPath;
+}
+
+function segmentDuration(seg) {
+  return Math.max(0, Number(seg.end_time_seconds) - Number(seg.start_time_seconds));
+}
+
+function resequenceSegments(segments) {
+  return segments
+    .filter((s) => segmentDuration(s) >= 0.1)
+    .map((s, i) => ({ ...s, order: i + 1 }));
+}
+
+function removeFillersFromSegments(segments, words, cutVideo) {
+  if (!cutVideo) return segments;
+  let removed = 0;
+  const next = [];
+  segments.forEach((segment) => {
+    const segStart = Number(segment.start_time_seconds) || 0;
+    const segEnd = Number(segment.end_time_seconds) || segStart;
+    const removals = (words || [])
+      .filter((w) => {
+        const clean = String(w.word || "")
+          .toLowerCase()
+          .replace(/[^a-z]/g, "");
+        const time = Number(w.time ?? w.start) || 0;
+        return FILLER_WORDS.has(clean) && time >= segStart && time <= segEnd;
+      })
+      .map((w) => {
+        const start = Number(w.time ?? w.start) || segStart;
+        return { start: Math.max(segStart, start - 0.06), end: Math.min(segEnd, start + 0.32) };
+      })
+      .sort((a, b) => a.start - b.start);
+
+    if (!removals.length) {
+      next.push(segment);
+      return;
+    }
+
+    let cursor = segStart;
+    removals.forEach((cut) => {
+      if (cut.start - cursor >= 0.18) {
+        next.push({
+          ...segment,
+          start_time_seconds: cursor,
+          end_time_seconds: cut.start,
+        });
+      }
+      cursor = Math.max(cursor, cut.end);
+      removed += 1;
+    });
+    if (segEnd - cursor >= 0.18) {
+      next.push({
+        ...segment,
+        start_time_seconds: cursor,
+        end_time_seconds: segEnd,
+      });
+    }
+  });
+  return resequenceSegments(next);
+}
+
+function removeSilencesFromSegments(segments, words, threshold = 0.45) {
+  const next = [];
+  segments.forEach((segment) => {
+    const segStart = Number(segment.start_time_seconds) || 0;
+    const segEnd = Number(segment.end_time_seconds) || segStart;
+    const segWords = (words || [])
+      .filter((w) => {
+        const t = Number(w.time ?? w.start) || 0;
+        return t >= segStart && t <= segEnd;
+      })
+      .sort((a, b) => (Number(a.time ?? a.start) || 0) - (Number(b.time ?? b.start) || 0));
+
+    if (segWords.length < 2) {
+      next.push(segment);
+      return;
+    }
+
+    let cursor = segStart;
+    for (let i = 0; i < segWords.length - 1; i += 1) {
+      const wEnd = Number(segWords[i].end ?? segWords[i].time) || 0;
+      const nextStart = Number(segWords[i + 1].time ?? segWords[i + 1].start) || 0;
+      if (nextStart - wEnd >= threshold) {
+        if (wEnd - cursor >= 0.15) {
+          next.push({
+            ...segment,
+            start_time_seconds: cursor,
+            end_time_seconds: wEnd,
+          });
+        }
+        cursor = nextStart;
+      }
+    }
+    if (segEnd - cursor >= 0.15) {
+      next.push({
+        ...segment,
+        start_time_seconds: cursor,
+        end_time_seconds: segEnd,
+      });
+    }
+  });
+  return resequenceSegments(next);
+}
+
+async function cutSegment(inputPath, outPath, start, end, isVideo = true, options = {}) {
+  const duration = Math.max(0.08, end - start);
+  const args = [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-ss",
+    `${start.toFixed(3)}`,
+    "-i",
+    inputPath,
+    "-t",
+    `${duration.toFixed(3)}`,
+  ];
+  if (isVideo) {
+    if (options.streamCopy) {
+      args.push("-c", "copy", "-avoid_negative_ts", "make_zero", "-map", "0");
+    } else if (options.highQuality) {
+      args.push(
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "14",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "256k",
+        "-ar",
+        "48000",
+        "-movflags",
+        "+faststart",
+      );
+    } else {
+      args.push(
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+      );
+    }
+  } else {
+    args.push("-c:a", "libmp3lame", "-b:a", "160k");
+  }
+  args.push(outPath);
+  await run("ffmpeg", args);
+}
+
+async function concatSegments(segmentPaths, outputPath, workDir) {
+  if (!segmentPaths.length) throw new Error("No segments to concat");
+  if (segmentPaths.length === 1) {
+    fs.copyFileSync(segmentPaths[0], outputPath);
+    return;
+  }
+  const listPath = path.join(workDir, "_concat.txt");
+  const names = segmentPaths.map((p) => path.basename(p));
+  fs.writeFileSync(
+    listPath,
+    names.map((n) => `file '${n.replace(/'/g, "'\\''")}'`).join("\n"),
+    "utf8",
+  );
+  await run("ffmpeg", [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    path.basename(listPath),
+    "-c",
+    "copy",
+    path.basename(outputPath),
+  ], { cwd: workDir });
+}
+
+async function renderReelPreview(sourcePath, segments, outputPath, options = {}) {
+  const workDir = path.dirname(outputPath);
+  let segs = resequenceSegments(segments || []);
+  const words = options.words || [];
+  const cutOptions = {
+    streamCopy: Boolean(options.streamCopy),
+    highQuality: Boolean(options.highQuality),
+  };
+
+  if (options.cutFillersFromVideo) {
+    segs = removeFillersFromSegments(segs, words, true);
+  }
+  if (options.cutSilences) {
+    segs = removeSilencesFromSegments(segs, words, options.silenceThreshold || 0.45);
+  }
+
+  const segPaths = [];
+  for (let i = 0; i < segs.length; i += 1) {
+    const s = Number(segs[i].start_time_seconds) || 0;
+    const e = Number(segs[i].end_time_seconds) || s;
+    const segOut = path.join(workDir, `_seg_${i.toString().padStart(3, "0")}.mp4`);
+    try {
+      await cutSegment(sourcePath, segOut, s, e, true, cutOptions);
+    } catch (error) {
+      if (cutOptions.streamCopy) {
+        await cutSegment(sourcePath, segOut, s, e, true, { highQuality: true });
+      } else {
+        throw error;
+      }
+    }
+    segPaths.push(segOut);
+  }
+  await concatSegments(segPaths, outputPath, workDir);
+  segPaths.forEach((p) => {
+    try {
+      fs.unlinkSync(p);
+    } catch (_) {}
+  });
+  return { outputPath, segments: segs };
+}
+
+function assColor(style) {
+  if (style === "boxed") return "&H00101010&";
+  if (style === "karaoke") return "&H0000D7FF&";
+  return "&H00FFFFFF&";
+}
+
+const CAPTION_GAP_SEC = 0.03;
+const MIN_WORD_SEC = 0.04;
+const MIN_CAPTION_SEC = 0.25;
+
+// Opus-style karaoke: white base, golden active word, soft shadow
+const KARAOKE_PRIMARY = "&H0050B4E6&"; // gold #E6B450 (ASS BBGGRR)
+const KARAOKE_SECONDARY = "&H00FFFFFF&"; // white upcoming
+const KARAOKE_SHADOW = "&H80000000&";
+const KARAOKE_FONT = "Segoe UI Black";
+const KARAOKE_BASE_SIZE = 135;
+const KARAOKE_CHUNK_SIZE = 2;
+const KARAOKE_LINE_HOLD_SEC = 0.12;
+const KARAOKE_FINAL_HOLD_SEC = 0.28;
+const ORPHAN_WORDS = new Set([
+  "her", "him", "his", "the", "and", "but", "or", "a", "an", "to", "of", "in", "on",
+  "at", "my", "your", "their", "our", "its", "it", "i", "me", "we", "they", "them",
+  "he", "she", "that", "this", "those", "these", "ther",
+]);
+
+function strictWordTimeline(words = []) {
+  return [...words]
+    .filter((w) => w && String(w.word || "").trim())
+    .sort((a, b) => (Number(a.localTime ?? a.time) || 0) - (Number(b.localTime ?? b.time) || 0))
+    .map((raw) => {
+      const start = Math.max(0, Number(raw.localTime ?? raw.time) || 0);
+      const endRaw = Number(raw.end);
+      const end = endRaw > start ? endRaw : start + MIN_WORD_SEC;
+      return { ...raw, word: String(raw.word || "").trim(), localTime: start, end };
+    });
+}
+
+function chunkWords(words, chunkSize = KARAOKE_CHUNK_SIZE) {
+  const chunks = [];
+  for (let i = 0; i < words.length; i += chunkSize) {
+    chunks.push(words.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
+
+function mergeOrphanChunks(chunks) {
+  if (chunks.length <= 1) return chunks;
+  const merged = [];
+  chunks.forEach((chunk) => {
+    const visible = chunk.filter((w) => {
+      const text = String(w.word || "").trim();
+      if (!text) return false;
+      const clean = text.toLowerCase().replace(/[^a-z]/g, "");
+      return clean.length > 0;
+    });
+    const lone = visible.length === 1
+      && ORPHAN_WORDS.has(String(visible[0].word || "").toLowerCase().replace(/[^a-z]/g, ""));
+    if (lone && merged.length) {
+      merged[merged.length - 1] = merged[merged.length - 1].concat(chunk);
+    } else {
+      merged.push(chunk);
+    }
+  });
+  return merged;
+}
+
+function buildKaraokeDialogueLines(playbackWords, hideFillers, posTag, toAssTime, chunkSize = KARAOKE_CHUNK_SIZE) {
+  const words = strictWordTimeline(playbackWords);
+  const lines = [];
+  const chunks = mergeOrphanChunks(chunkWords(words, Math.max(1, Number(chunkSize) || KARAOKE_CHUNK_SIZE)));
+  let prevEnd = 0;
+  chunks.forEach((chunk, index) => {
+    if (!chunk.length) return;
+    const lineStart = Math.max(prevEnd + CAPTION_GAP_SEC, chunk[0].localTime);
+    let lineEnd = chunk[chunk.length - 1].end + KARAOKE_LINE_HOLD_SEC;
+    const isLast = index + 1 >= chunks.length;
+    if (isLast) {
+      lineEnd = chunk[chunk.length - 1].end + KARAOKE_FINAL_HOLD_SEC;
+    } else {
+      const nextStart = chunks[index + 1][0].localTime;
+      lineEnd = Math.min(lineEnd, Math.max(lineStart + MIN_WORD_SEC, nextStart - CAPTION_GAP_SEC));
+    }
+    const parts = [];
+    let relCursor = 0;
+    chunk.forEach((w) => {
+      const text = String(w.word || "").trim();
+      if (!text) return;
+      const clean = text.toLowerCase().replace(/[^a-z]/g, "");
+      if (hideFillers && FILLER_WORDS.has(clean)) return;
+      const relStart = Math.max(0, w.localTime - lineStart);
+      const relEnd = Math.max(relStart + MIN_WORD_SEC, w.end - lineStart);
+      const gapCs = Math.max(0, Math.round((relStart - relCursor) * 100));
+      const durCs = Math.max(1, Math.round((relEnd - relStart) * 100));
+      if (gapCs > 0) parts.push(`{\\kf${gapCs}}`);
+      parts.push(`{\\kf${durCs}}${text.replace(/\{/g, "\\{").replace(/\}/g, "\\}")} `);
+      relCursor = relEnd;
+    });
+    if (!parts.length) return;
+    lines.push(
+      `Dialogue: 0,${toAssTime(lineStart)},${toAssTime(lineEnd)},Default,,0,0,0,,${posTag}${parts.join("").trim()}`,
+    );
+    prevEnd = lineEnd;
+  });
+  return lines;
+}
+
+function normalizeCaptionTiming(captions = []) {
+  const sorted = [...captions]
+    .filter((cap) => cap && (cap.text || cap.words?.length))
+    .sort((a, b) => (Number(a.start_time_seconds) || 0) - (Number(b.start_time_seconds) || 0));
+  let prevEnd = 0;
+  sorted.forEach((cap, index) => {
+    const words = strictWordTimeline(cap.words || []);
+    let start;
+    let end;
+    if (words.length) {
+      start = Math.max(prevEnd + CAPTION_GAP_SEC, Number(words[0].localTime) || 0);
+      end = Math.max(start + MIN_CAPTION_SEC, Number(words[words.length - 1].end) || start + MIN_CAPTION_SEC);
+      cap.words = words;
+    } else {
+      start = Math.max(prevEnd + CAPTION_GAP_SEC, Number(cap.start_time_seconds) || 0);
+      end = Math.max(start + MIN_CAPTION_SEC, Number(cap.end_time_seconds) || start + MIN_CAPTION_SEC);
+    }
+    if (index + 1 < sorted.length) {
+      const nextWords = sorted[index + 1].words || [];
+      const nextStart = nextWords.length
+        ? Number(nextWords[0].localTime) || Number(sorted[index + 1].start_time_seconds) || 0
+        : Number(sorted[index + 1].start_time_seconds) || 0;
+      end = Math.min(end, Math.max(start + MIN_CAPTION_SEC, nextStart - CAPTION_GAP_SEC));
+    }
+    cap.start_time_seconds = start;
+    cap.end_time_seconds = end;
+    if (words.length) {
+      cap.text = words.map((w) => String(w.word || "").trim()).filter(Boolean).join(" ");
+    }
+    prevEnd = end;
+  });
+  return sorted;
+}
+
+function buildAssSubtitles(captions, words, style, size, hideFillers, canvas = {}, outW = 1080, outH = 1920, opts = {}) {
+  const captionX = Number(canvas.captionX ?? 50);
+  const captionY = Number(canvas.captionY ?? 86);
+  const scaledSize = Math.max(KARAOKE_BASE_SIZE, Math.round(Number(size || KARAOKE_BASE_SIZE) * (outH / 1920)));
+  const posX = Math.round(outW * (captionX / 100));
+  const posY = Math.round(outH * (captionY / 100));
+  const posTag = `{\\an2\\pos(${posX},${posY})}`;
+  const chunkSize = Number(opts.captionChunkSize) || KARAOKE_CHUNK_SIZE;
+  const timedCaptions = normalizeCaptionTiming(captions);
+
+  const hookSize = Math.round(scaledSize * 0.68);
+  const nameSize = Math.round(scaledSize * 0.46);
+  const topCenterY = Math.round(outH * 0.11);
+  const topRightX = Math.round(outW * 0.92);
+  const topRightY = Math.round(outH * 0.09);
+  const header = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${outW}
+PlayResY: ${outH}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,${KARAOKE_FONT},${scaledSize},${style === "karaoke" ? KARAOKE_PRIMARY : "&H00FFFFFF&"},${style === "karaoke" ? KARAOKE_SECONDARY : "&H00E6B450&"},${KARAOKE_SHADOW},&H00000000&,-1,0,0,0,100,100,0,0,1,0,4,2,40,40,100,1
+Style: TextHook,${KARAOKE_FONT},${hookSize},&H00FFFFFF&,&H00FFFFFF&,&H00000000&,&H64000000&,-1,0,0,0,100,100,0,0,1,5,3,8,60,60,80,1
+Style: NameTag,${KARAOKE_FONT},${nameSize},&H0050B4E6&,&H0050B4E6&,&H00000000&,&H64000000&,-1,0,0,0,100,100,0,0,1,3,2,9,60,60,80,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+  const lines = [header];
+  const toAssTime = (sec) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    const cs = Math.floor((sec % 1) * 100);
+    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}.${cs.toString().padStart(2, "0")}`;
+  };
+
+  const escapeAss = (t) => String(t || "").replace(/\{/g, "(").replace(/\}/g, ")").replace(/\n/g, " ").trim();
+  const overlayLines = [];
+  const textHook = escapeAss(opts.textHook);
+  const speakerName = escapeAss(opts.speakerName);
+  const hookTag = `{\\an8\\pos(${Math.round(outW / 2)},${topCenterY})}`;
+  const nameTag = `{\\an9\\pos(${topRightX},${topRightY})}`;
+
+  // Sequential top overlays — never stack with lower-third karaoke captions.
+  if (textHook) {
+    overlayLines.push(
+      `Dialogue: 1,${toAssTime(0)},${toAssTime(2.15)},TextHook,,0,0,0,,${hookTag}{\\fad(160,200)}${textHook}`,
+    );
+  }
+  if (speakerName) {
+    const title = escapeAss(opts.speakerTitle);
+    const nameText = title ? `${speakerName}  |  ${title}` : speakerName;
+    const nameStart = textHook ? 2.25 : 0.4;
+    const nameEnd = Math.max(nameStart + 2.0, 5.0);
+    overlayLines.push(
+      `Dialogue: 1,${toAssTime(nameStart)},${toAssTime(nameEnd)},NameTag,,0,0,0,,${nameTag}{\\fad(180,240)}${nameText}`,
+    );
+  }
+
+  if (style === "karaoke") {
+    const playback = strictWordTimeline(words?.length ? words : []);
+    if (playback.length) {
+      lines.push(...buildKaraokeDialogueLines(playback, hideFillers, posTag, toAssTime, chunkSize));
+      lines.push(...overlayLines);
+      return lines.join("\n");
+    }
+    timedCaptions.forEach((cap) => {
+      const capWords = strictWordTimeline(cap.words?.length ? cap.words : []);
+      if (!capWords.length) return;
+      lines.push(
+        ...buildKaraokeDialogueLines(capWords, hideFillers, posTag, toAssTime, chunkSize),
+      );
+    });
+    lines.push(...overlayLines);
+    return lines.join("\n");
+  }
+
+  timedCaptions.forEach((cap) => {
+    let text = String(cap.text || "");
+    if (hideFillers) {
+      text = text
+        .split(/\s+/)
+        .filter((w) => !FILLER_WORDS.has(w.toLowerCase().replace(/[^a-z]/g, "")))
+        .join(" ");
+    }
+    if (!text.trim()) return;
+    const start = Number(cap.start_time_seconds) || 0;
+    const end = Number(cap.end_time_seconds) || start + 1;
+    lines.push(
+      `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${posTag}${text.replace(/\{/g, "\\{").replace(/\}/g, "\\}")}`,
+    );
+  });
+  lines.push(...overlayLines);
+  return lines.join("\n");
+}
+
+function buildCropFilter(srcW, srcH, canvas, outW = 1080, outH = 1920) {
+  const targetAR = outW / outH;
+  const srcAR = srcW / srcH;
+  const zoom = Math.max(1, Number(canvas?.zoom) || 1);
+  const focusX = Math.max(0, Math.min(1, Number(canvas?.cropX ?? 0.5) + (Number(canvas?.panX) || 0) / 200));
+  const focusY = Math.max(0, Math.min(1, Number(canvas?.cropY ?? 0.5) + (Number(canvas?.panY) || 0) / 200));
+  const scaleFlags = "flags=lanczos+accurate_rnd+full_chroma_int";
+  let cropW;
+  let cropH;
+  if (srcAR > targetAR) {
+    cropH = Math.round(srcH / zoom);
+    cropW = Math.round(cropH * targetAR);
+  } else {
+    cropW = Math.round(srcW / zoom);
+    cropH = Math.round(cropW / targetAR);
+  }
+  cropW = Math.max(2, Math.min(cropW, srcW));
+  cropH = Math.max(2, Math.min(cropH, srcH));
+  const maxX = Math.max(0, srcW - cropW);
+  const maxY = Math.max(0, srcH - cropH);
+  const cx = Math.round(maxX * focusX);
+  const cy = Math.round(maxY * focusY);
+  return `crop=${cropW}:${cropH}:${cx}:${cy},scale=${outW}:${outH}:${scaleFlags},setsar=1`;
+}
+
+function parseBitrate(value, fallback = "20M") {
+  const raw = String(value || fallback).trim();
+  const match = raw.match(/^(\d+(?:\.\d+)?)([kKmM])?$/);
+  if (!match) return raw;
+  const amount = Number(match[1]);
+  const unit = (match[2] || "M").toUpperCase();
+  if (unit === "K") return `${Math.round(amount)}k`;
+  return `${amount}M`;
+}
+
+function buildExportEncodeArgs({ quality = "high", bitrate = "20M", fps, sourceFps = 30 }) {
+  const targetFps = fps && fps !== "source" ? Number(fps) : Math.round(sourceFps) || 30;
+  const presets = {
+    high: {
+      preset: "slow",
+      crf: "16",
+      maxrate: parseBitrate(bitrate, "22M"),
+      bufsize: "44M",
+      audioBitrate: "320k",
+      profile: "high",
+      tune: "film",
+    },
+    medium: {
+      preset: "medium",
+      crf: "19",
+      maxrate: parseBitrate(bitrate, "15M"),
+      bufsize: "30M",
+      audioBitrate: "256k",
+      profile: "high",
+      tune: "film",
+    },
+    low: {
+      preset: "fast",
+      crf: "22",
+      maxrate: parseBitrate(bitrate, "8M"),
+      bufsize: "16M",
+      audioBitrate: "192k",
+      profile: "main",
+      tune: null,
+    },
+  };
+  const cfg = presets[quality] || presets.high;
+  const videoArgs = [
+    "-c:v",
+    "libx264",
+    "-preset",
+    cfg.preset,
+    "-profile:v",
+    cfg.profile,
+    "-level",
+    "4.2",
+    "-pix_fmt",
+    "yuv420p",
+    "-crf",
+    cfg.crf,
+    "-maxrate",
+    cfg.maxrate,
+    "-bufsize",
+    cfg.bufsize,
+    "-colorspace",
+    "bt709",
+    "-color_primaries",
+    "bt709",
+    "-color_trc",
+    "bt709",
+  ];
+  if (cfg.tune) {
+    videoArgs.push("-tune", cfg.tune);
+  }
+  if (fps && fps !== "source") {
+    videoArgs.push("-r", String(targetFps));
+  }
+  const audioArgs = [
+    "-c:a",
+    "aac",
+    "-b:a",
+    cfg.audioBitrate,
+    "-ar",
+    "48000",
+    "-ac",
+    "2",
+  ];
+  return { videoArgs, audioArgs, targetFps };
+}
+
+async function exportReel(sourcePath, outputPath, payload) {
+  const {
+    segments,
+    captions,
+    words,
+    canvas = {},
+    musicPath,
+    musicVolume = 0.25,
+    cutFillersFromVideo = false,
+    cutSilences = false,
+    hideFillersInSubtitles = false,
+    captionStyle = "bold",
+    captionSize = 42,
+    captionChunkSize,
+    textHook = "",
+    speakerName = "",
+    speakerTitle = "",
+    quality = "high",
+    bitrate = "22M",
+    fps = "source",
+    resolution = { width: 1080, height: 1920 },
+  } = payload;
+
+  const workDir = path.join(os.tmpdir(), `istv-export-${Date.now()}`);
+  fs.mkdirSync(workDir, { recursive: true });
+
+  try {
+    const sourceProbe = await probeVideo(sourcePath);
+    if (!sourceProbe.hasVideo) {
+      throw new Error(
+        "Source file has no video stream. Use the original documentary video file for export.",
+      );
+    }
+    const previewPath = path.join(workDir, "joined.mp4");
+    const { segments: processedSegs } = await renderReelPreview(sourcePath, segments, previewPath, {
+      words,
+      cutFillersFromVideo,
+      cutSilences,
+      // Re-encode cuts for frame-accurate audio — required for karaoke sync with Rev.ai timings
+      streamCopy: false,
+      highQuality: true,
+    });
+
+    const probe = await probeVideo(previewPath);
+    const assPath = path.join(workDir, "subs.ass");
+    const playbackWords = words?.length
+      ? words
+      : (payload.playbackWords || []);
+    const outW = resolution.width || 1080;
+    const outH = resolution.height || 1920;
+    fs.writeFileSync(
+      assPath,
+      buildAssSubtitles(
+        captions,
+        playbackWords,
+        captionStyle,
+        captionSize,
+        hideFillersInSubtitles,
+        canvas,
+        outW,
+        outH,
+        { captionChunkSize, textHook, speakerName, speakerTitle },
+      ),
+      "utf8",
+    );
+
+    const crop = buildCropFilter(probe.width, probe.height, canvas, outW, outH);
+    const assEscaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
+    const { videoArgs, audioArgs } = buildExportEncodeArgs({
+      quality,
+      bitrate,
+      fps,
+      sourceFps: sourceProbe.fps || probe.fps || 30,
+    });
+
+    const vf = `${crop},subtitles='${assEscaped}'`;
+    const args = [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      previewPath,
+    ];
+
+    if (musicPath && fs.existsSync(musicPath)) {
+      args.push("-i", musicPath);
+      args.push(
+        "-filter_complex",
+        `[0:v]${vf}[v];[0:a]volume=1[a0];[1:a]volume=${musicVolume}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[a]`,
+        "-map",
+        "[v]",
+        "-map",
+        "[a]",
+      );
+    } else {
+      args.push("-vf", vf);
+    }
+
+    args.push(
+      ...videoArgs,
+      "-aspect",
+      `${outW}:${outH}`,
+      ...audioArgs,
+      "-movflags",
+      "+faststart",
+      outputPath,
+    );
+
+    await run("ffmpeg", args);
+    return { outputPath, segments: processedSegs, quality, sourceFps: sourceProbe.fps };
+  } finally {
+    try {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    } catch (_) {}
+  }
+}
+
+async function createProxy(sourcePath, outDir) {
+  const outPath = path.join(outDir, "proxy.mp4");
+  await run("ffmpeg", [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    sourcePath,
+    "-vf",
+    "scale=-2:480",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "28",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "96k",
+    "-movflags",
+    "+faststart",
+    outPath,
+  ]);
+  return outPath;
+}
+
+module.exports = {
+  probeVideo,
+  extractAudio,
+  compressAudio,
+  renderReelPreview,
+  exportReel,
+  buildAssSubtitles,
+  createProxy,
+  removeFillersFromSegments,
+  removeSilencesFromSegments,
+};

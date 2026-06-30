@@ -1,0 +1,20 @@
+.env
+__pycache__/
+*.pyc
+
+# Never commit large media outputs
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.m4v
+*.zip
+
+# Job bundles (transcripts, analysis, exports) stay local
+generated_data/*/
+!generated_data/.gitkeep
+
+# Source videos stay local
+input/*
+!input/.gitkeep
