@@ -1,5 +1,45 @@
 # The Reels Tool Logic
 
+Turn a long-form documentary into short-form 9:16 karaoke reels. This repo has
+**three components** that share the same core pipeline (`src/`) and FFmpeg engine
+(`export/`):
+
+| Component | What it is | Folder |
+|-----------|-----------|--------|
+| **CLI tool** | Drop a video in `input/`, run one command, get reels in `generated_data/`. | repo root (`generate_reels.py`) |
+| **Backend** | FastAPI service: Rev.ai transcription + Claude reel selection. Holds the API keys. | [`backend/`](backend/) |
+| **Desktop editor** | Cross-platform Electron app (Premiere-style) to edit + export reels. Only compressed audio leaves the machine. | [`desktop/`](desktop/) |
+
+## First-time setup (all components)
+
+1. **Install prerequisites:** Python 3.11+, Node.js, and FFmpeg + ffprobe on your PATH.
+2. **Add your keys:**
+   ```bash
+   cp .env.example .env       # then edit .env and fill in the two keys
+   ```
+   `.env` is gitignored and never committed. You need a **Rev.ai** key and an
+   **Anthropic (Claude)** key — see `.env.example` for where to get them.
+3. **Python deps:** `pip install -r requirements.txt` (CLI) and, for the backend,
+   `pip install -r backend/requirements.txt`.
+
+### Run the backend (needed by the desktop app)
+```bash
+python -m uvicorn backend.app:app --port 8722
+```
+
+### Run the desktop editor
+```bash
+cd desktop
+npm install
+npm start        # opens the editor window
+```
+The app talks to the backend at `http://127.0.0.1:8722` (override with `ISTV_BACKEND_URL`).
+See [`desktop/README.md`](desktop/README.md) and [`backend/README.md`](backend/README.md) for details.
+
+---
+
+## CLI tool
+
 Standalone reel generation pipeline — no website, no desktop app, no API server.
 
 Drop a source video into `input/`, run one command, get 9:16 karaoke reels in `generated_data/`.
@@ -22,9 +62,8 @@ Uses the **updated_v2_test2** profile (same as `caylene_updated_v2_test2`):
 ## Setup
 
 ```bash
-cd "the reels tool logic - main file"
 pip install -r requirements.txt
-copy .env.example .env
+cp .env.example .env
 ```
 
 Edit `.env` and add your `REVAI_API_KEY` and `CLAUDE_API_KEY`.
