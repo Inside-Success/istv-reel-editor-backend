@@ -6,6 +6,7 @@ from anthropic import Anthropic
 from src.transcription import fmt_time
 from src.cutter import (
     MAX_REEL_SECONDS,
+    REEL_END_TOLERANCE_SECONDS,
     build_reel_cut_sheet,
     extract_reel_segment_ids,
     normalize_order_mode,
@@ -79,7 +80,7 @@ Tag each reel with its primary "content_type" from that list.
 - A reel = an ordered list of segment ids forming a complete little arc (hook -> point -> payoff).
 - CONTEXT COMPLETE: a cold viewer must understand who is speaking, what happened, and why it matters. Include bridging setup segments — never stitch a payoff to a hook while skipping the sentences in between. If you skip segment ids, the reel will feel random. No pronoun or reference inside the reel may point to a person/thing that only appears in a skipped or un-included sentence.
 - OPEN ON A SELF-CONTAINED HOOK: the first segment must stop a thumb — a bold claim, question, number, or stake — AND must NOT depend on an earlier, un-included sentence. Never open on an unresolved reference: a bare pronoun ("She did it...", "They told me...", "He left...", "It changed everything..."), a demonstrative ("This was the moment...", "That's when..."), or a connector ("And so...", "But then...", "Because of that..."). The subject must be introduced by name, role, or clear noun WITHIN the reel. If the hook references something set up earlier, INCLUDE that setup segment so the context is resolved inside the reel. Never open on filler/continuation ("for a very long time I mean...", "After like three maybe..."). If a later line is a stronger opener, lead with it (cold-open) and set "order_mode":"hook_pull" — it must still be understandable with zero prior context.
-- END ON A LANDED BEAT: the last segment MUST end on a finished thought the speaker has delivered — not mid-phrase, not while their voice is still rising. Never end on a connective ("and/but/so/that/or") or dangling setup ("I felt", "she was", "into my", "a lot of that"). If the payoff continues in the next segment (even one word like "career" after "into my"), INCLUDE that segment. The viewer must hear the emotional landing, not a hard cut that sounds like more was coming.
+- END ON A LANDED BEAT: the last segment MUST end on a FULLY finished thought the speaker has delivered — the viewer should feel the idea is complete and nothing is left hanging, NOT that the speaker was about to say more. Never end mid-phrase, while the voice is still rising, on a connective ("and/but/so/that/or"), or on dangling setup ("I felt", "she was", "into my", "a lot of that", "to scope it"). If the thought finishes in the following segment (even one trailing word like "career" after "into my"), INCLUDE that segment so the reel resolves — it is far better to run a few seconds long than to cut a beat early. The reel must END on closure, not a hard cut that sounds like the sentence kept going.
 - BLEND if it helps: you may stitch up to ~5 non-contiguous segments into one reel if they genuinely connect and flow when spoken aloud.
 - {{LENGTH_RULE}}
 - NO FILLER at the edges ("um/uh/you know/and and").
@@ -135,7 +136,7 @@ V2_PROMPT_ADDENDUM = """
 
 # V2 QUALITY BAR (strict — this set is judged for post-readiness)
 - HARD HOOK: the FIRST spoken line must be a complete, standalone sentence that stops the scroll on its own. Never start mid-sentence or on a fragment ("Was the first girl...", "amazing is...", "Most importantly is..."). If the strongest hook is a few lines in, lead with it.
-- CLEAN LANDING: the LAST spoken line must complete the thought with finality. Never end on a preposition/filler ("...to", "...I would say", "...you know") or a trailing clause.
+- CLEAN LANDING: the LAST spoken line must complete the thought with finality — it should feel like a deliberate closing line, the kind that earns a beat of silence after it, never like the speaker was interrupted or had more coming. Never end on a preposition/filler ("...to", "...I would say", "...you know"), a trailing clause, or a line that only makes sense if the next sentence follows. If finishing the thought needs one more sentence, include it even if the reel runs slightly over the target.
 - ZERO REPETITION: never include two segments that say essentially the same thing. Pick the single strongest phrasing.
 - ON-TOPIC ONLY: drop any aside, tangent, or self-referential line (e.g. "in my videos and my contents") that does not serve THIS reel's single idea.
 - TIGHT: every included segment must earn its place; if removing it doesn't hurt the arc, remove it."""
@@ -146,15 +147,24 @@ def _profile_is_v2() -> bool:
 
 
 def _length_rule() -> str:
-    """Build the LENGTH guidance line from the active duration window (env-configurable)."""
+    """Build the LENGTH guidance line from the active duration window (env-configurable).
+
+    Completeness-first: a finished thought + full context always beats hitting the
+    window. The story may justify running a little under the floor or a little over
+    the ceiling — but only when those extra seconds buy a complete ending or the
+    setup a cold viewer needs.
+    """
     lo = int(round(reel_min_seconds()))
     hi = int(round(reel_max_seconds()))
-    # Suggest a sweet-spot a bit inside the window for the model to aim at.
-    sweet_lo = lo
-    sweet_hi = min(hi, lo + 15) if hi - lo > 15 else hi
+    flex = int(round(REEL_END_TOLERANCE_SECONDS))
     return (
-        f"LENGTH: target {sweet_lo}-{sweet_hi} seconds, never below {lo}s and never above {hi}s. "
-        f"Prefer a complete thought near {lo}-{hi}s; cut filler to fit; never pad."
+        f"LENGTH: target {lo}-{hi} seconds, and use the FULL range when the story is rich — "
+        f"do not crowd everything into short {lo}-{int((lo + hi) / 2)}s clips. "
+        f"A COMPLETE, satisfying ending and full opening context ALWAYS beat hitting the window: "
+        f"if (and only if) the story demands it, you may run up to ~{flex}s under {lo}s "
+        f"or up to ~{flex}s over {hi}s so the thought lands and nothing feels cut off. "
+        f"Never end a thought early just to stay under {hi}s, and never pad with filler to reach {lo}s. "
+        f"When in doubt, INCLUDE the sentence that finishes the thought rather than cutting on a rising or unfinished line."
     )
 
 
@@ -709,7 +719,7 @@ def _normalize_cut_sheets(
     protect_ends = True
     max_dur = reel_max_seconds()
     min_dur = reel_min_seconds()
-    soft_dur = max_dur + 5.0
+    soft_dur = max_dur + REEL_END_TOLERANCE_SECONDS
 
     for reel in analysis.get("reels", []):
         order_mode = normalize_order_mode(reel.get("order_mode") or reel.get("assembly_mode"))

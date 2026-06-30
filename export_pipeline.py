@@ -94,6 +94,75 @@ def export_reel_mp4(reel: dict, source: Path, out_path: Path) -> None:
         raise RuntimeError(f"Export too small or missing: {out_path}")
 
 
+QUALITY_BITRATE = {"low": "10M", "medium": "16M", "high": "24M"}
+
+
+def export_reel_mp4_ex(reel: dict, source: Path, out_path: Path, options: dict) -> None:
+    """Export one edited reel honoring the desktop editor's per-reel + dialog options.
+
+    Reuses the same caption builder + Node/FFmpeg engine as export_reel_mp4, but
+    every knob (resolution, fps, quality, filler/silence cuts, 9:16 crop, music)
+    comes from `options` so the export bakes in exactly what the editor shows.
+    """
+    options = options or {}
+    segments = sanitize_segments(reel.get("editor_cut_sheet") or [])
+    captions = build_captions_for_reel(reel, segments)
+    words = build_playback_words(reel, segments)
+
+    canvas = dict(DEFAULT_EXPORT_CANVAS)
+    canvas.update(options.get("canvas") or {})
+
+    resolution = options.get("resolution") or {"width": 1080, "height": 1920}
+    quality = str(options.get("quality") or "high").lower()
+    bitrate = options.get("bitrate") or QUALITY_BITRATE.get(quality, "22M")
+    fps = options.get("fps") or "source"
+    chunk = int(options.get("captionChunkSize") or os.getenv("REEL_CAPTION_CHUNK", "4") or 4)
+
+    payload = {
+        "segments": segments,
+        "captions": captions,
+        "words": words,
+        "playbackWords": words,
+        "canvas": canvas,
+        "captionStyle": "karaoke",
+        "captionSize": int(canvas.get("captionSize") or 135),
+        "captionChunkSize": chunk,
+        "hideFillersInSubtitles": True,
+        "cutFillersFromVideo": bool(options.get("cutFillersFromVideo")),
+        "cutSilences": bool(options.get("cutSilences")),
+        "quality": quality,
+        "bitrate": bitrate,
+        "fps": fps,
+        "resolution": {"width": int(resolution["width"]), "height": int(resolution["height"])},
+    }
+
+    if options.get("encodePreset"):
+        payload["encodePreset"] = str(options["encodePreset"])
+
+    music = options.get("music")
+    if music and music.get("path"):
+        payload["musicPath"] = str(music["path"])
+        payload["musicVolume"] = float(music.get("volume", 0.25))
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+        json.dump(payload, tmp, ensure_ascii=False)
+        payload_path = tmp.name
+    try:
+        proc = subprocess.run(
+            ["node", str(CLI), str(source), payload_path, str(out_path)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    finally:
+        Path(payload_path).unlink(missing_ok=True)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "export failed").strip()[:800])
+    if not out_path.is_file() or out_path.stat().st_size < 20_000:
+        raise RuntimeError(f"Export too small or missing: {out_path}")
+
+
 def export_all_reels(
     job_id: str,
     analysis: dict,

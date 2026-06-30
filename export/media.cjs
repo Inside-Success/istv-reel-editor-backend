@@ -601,7 +601,7 @@ function parseBitrate(value, fallback = "20M") {
   return `${amount}M`;
 }
 
-function buildExportEncodeArgs({ quality = "high", bitrate = "20M", fps, sourceFps = 30 }) {
+function buildExportEncodeArgs({ quality = "high", bitrate = "20M", fps, sourceFps = 30, presetOverride = null }) {
   const targetFps = fps && fps !== "source" ? Number(fps) : Math.round(sourceFps) || 30;
   const presets = {
     high: {
@@ -633,11 +633,12 @@ function buildExportEncodeArgs({ quality = "high", bitrate = "20M", fps, sourceF
     },
   };
   const cfg = presets[quality] || presets.high;
+  const preset = presetOverride || cfg.preset; // desktop export may request a faster preset
   const videoArgs = [
     "-c:v",
     "libx264",
     "-preset",
-    cfg.preset,
+    preset,
     "-profile:v",
     cfg.profile,
     "-level",
@@ -697,6 +698,7 @@ async function exportReel(sourcePath, outputPath, payload) {
     bitrate = "22M",
     fps = "source",
     resolution = { width: 1080, height: 1920 },
+    encodePreset = null,
   } = payload;
 
   const workDir = path.join(os.tmpdir(), `istv-export-${Date.now()}`);
@@ -749,6 +751,7 @@ async function exportReel(sourcePath, outputPath, payload) {
       bitrate,
       fps,
       sourceFps: sourceProbe.fps || probe.fps || 30,
+      presetOverride: encodePreset,
     });
 
     const vf = `${crop},subtitles='${assEscaped}'`;

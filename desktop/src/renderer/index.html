@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; media-src 'self' file:; style-src 'self' 'unsafe-inline';" />
+    <title>ISTV Reel Editor</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">ISTV&nbsp;Reel&nbsp;Editor</div>
+        <div class="top-actions">
+          <button id="openBtn" class="btn primary">Open Project…</button>
+          <input id="nameInput" class="name-input" type="text" placeholder="Speaker name (optional)" disabled />
+          <button id="genBtn" class="btn" disabled>Generate Reels</button>
+          <span class="top-divider"></span>
+          <button id="undoBtn" class="btn icon" title="Undo (Ctrl+Z)" disabled>↶</button>
+          <button id="redoBtn" class="btn icon" title="Redo (Ctrl+Y)" disabled>↷</button>
+          <button id="saveBtn" class="btn" title="Save project (Ctrl+S)" disabled>Save</button>
+          <button id="exportBtn" class="btn primary" disabled>Export…</button>
+        </div>
+        <div class="phase-badge">Phase&nbsp;1 · Source</div>
+      </header>
+
+      <main class="layout">
+        <!-- Left: reels panel (populated in later phases) -->
+        <aside class="panel reels-panel">
+          <div class="panel-title">Reels</div>
+          <div id="reelsList" class="reels-list">
+            <div class="empty">No reels yet.<br />Open a project, then Generate Reels.</div>
+          </div>
+        </aside>
+
+        <!-- Center: source / program viewer -->
+        <section class="viewer">
+          <div id="dropHint" class="drop-hint">
+            <div class="drop-inner">
+              <div class="drop-title">Open a documentary to begin</div>
+              <div class="drop-sub">The full video stays on this machine. A low-res proxy is built for smooth editing.</div>
+              <button id="openBtn2" class="btn primary big">Open Project…</button>
+            </div>
+          </div>
+
+          <div id="stage" class="stage hidden">
+            <div class="monitor">
+              <div id="frame" class="frame frame-fit">
+                <video id="video" preload="auto" playsinline></video>
+                <div id="subOverlay" class="sub-overlay hidden"></div>
+              </div>
+            </div>
+
+            <div class="transport">
+              <button id="toStart" class="btn icon" title="Go to start">⏮</button>
+              <button id="stepBack" class="btn icon" title="Previous frame">◀|</button>
+              <button id="playPause" class="btn icon play" title="Play/Pause (Space)">▶</button>
+              <button id="stepFwd" class="btn icon" title="Next frame">|▶</button>
+              <button id="toEnd" class="btn icon" title="Go to end">⏭</button>
+              <span id="tc" class="tc">00:00:00:00</span>
+              <span class="tc-sep">/</span>
+              <span id="tcTotal" class="tc dim">00:00:00:00</span>
+              <div class="transport-right">
+                <button id="previewMode" class="btn sm" title="Toggle 9:16 reframe preview">9:16 Preview</button>
+              </div>
+            </div>
+
+            <div class="timeline">
+              <div class="tl-toolbar">
+                <span class="tl-label">Timeline</span>
+                <div class="tl-zoom">
+                  <button id="zoomOut" class="btn icon sm" title="Zoom out">−</button>
+                  <span id="zoomLabel" class="zoom-label">100%</span>
+                  <button id="zoomIn" class="btn icon sm" title="Zoom in">+</button>
+                </div>
+              </div>
+              <div id="ruler" class="ruler"></div>
+              <div id="track" class="track">
+                <div id="clip" class="clip"><span id="clipName" class="clip-name"></span></div>
+                <div id="playhead" class="playhead"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Right: inspector — source metadata OR reel editor -->
+        <aside class="panel inspector">
+          <div id="sourceInspector">
+            <div class="panel-title">Source</div>
+            <dl id="meta" class="meta">
+              <div><dt>File</dt><dd id="mFile">—</dd></div>
+              <div><dt>Resolution</dt><dd id="mRes">—</dd></div>
+              <div><dt>Duration</dt><dd id="mDur">—</dd></div>
+              <div><dt>Frame rate</dt><dd id="mFps">—</dd></div>
+              <div><dt>Codec</dt><dd id="mCodec">—</dd></div>
+              <div><dt>Proxy</dt><dd id="mProxy">—</dd></div>
+            </dl>
+          </div>
+
+          <div id="reelInspector" class="hidden">
+            <div class="panel-title">Edit Reel</div>
+            <div class="insp-body">
+              <div class="insp-reel-title" id="iTitle">—</div>
+              <div class="insp-row dim"><span id="iIO">in — / out —</span><span id="iDur" class="ml-auto">—</span></div>
+
+              <div class="insp-group">
+                <div class="ig-head">Trim</div>
+                <div class="trim-btns">
+                  <button class="btn sm" data-trim="in" data-d="-0.5" title="Extend in (earlier)">⟸ In</button>
+                  <button class="btn sm" data-trim="in" data-d="0.5" title="Cut in (later)">In ⟹</button>
+                  <button class="btn sm" data-trim="out" data-d="-0.5" title="Cut out (earlier)">⟸ Out</button>
+                  <button class="btn sm" data-trim="out" data-d="0.5" title="Extend out (later)">Out ⟹</button>
+                </div>
+                <div class="ig-hint">Or drag the handles on the reel in the timeline.</div>
+              </div>
+
+              <div class="insp-group">
+                <div class="ig-head">
+                  <label class="switch"><input type="checkbox" id="optSubtitles" checked /> Subtitles (word-highlight)</label>
+                </div>
+                <div class="ig-head">
+                  <label class="switch"><input type="checkbox" id="optFillers" checked /> Remove filler words</label>
+                </div>
+                <div class="ig-head">
+                  <label class="switch"><input type="checkbox" id="optSilences" /> Remove silences</label>
+                </div>
+              </div>
+
+              <div class="insp-group">
+                <div class="ig-head">9:16 Reframe</div>
+                <div class="ig-row"><span>Zoom</span><input type="range" id="optZoom" min="1" max="3" step="0.05" value="1" /><span id="optZoomVal" class="dim">1.00×</span></div>
+                <div class="ig-hint">Drag inside the 9:16 preview to reposition. <button id="reframeReset" class="link-btn">Reset</button></div>
+              </div>
+
+              <div class="insp-group">
+                <div class="ig-head">Music</div>
+                <div class="ig-row"><button id="addMusic" class="btn sm">Add music…</button><button id="removeMusic" class="btn sm hidden">Remove</button></div>
+                <div class="ig-music dim" id="musicName">No track</div>
+                <div class="ig-row" id="musicVolRow" style="display:none"><span>Volume</span><input type="range" id="musicVol" min="0" max="1" step="0.05" value="0.25" /><span id="musicVolVal" class="dim">25%</span></div>
+              </div>
+
+              <div class="insp-group">
+                <div class="ig-head">Subtitles <span class="dim">(click a word to edit)</span></div>
+                <div id="subEditor" class="sub-editor"></div>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </main>
+
+      <!-- Proxy build overlay -->
+      <div id="proxyOverlay" class="overlay hidden">
+        <div class="overlay-card">
+          <div class="overlay-title">Importing master clip…</div>
+          <div class="overlay-sub" id="proxySub">Building low-res proxy for smooth scrubbing</div>
+          <div class="progress"><div id="proxyBar" class="progress-bar"></div></div>
+          <div class="progress-pct" id="proxyPct">0%</div>
+        </div>
+      </div>
+
+      <!-- Pipeline panel (Generate Reels) -->
+      <div id="pipelineOverlay" class="overlay hidden">
+        <div class="overlay-card wide">
+          <div class="overlay-title">Generating Reels</div>
+          <div class="overlay-sub">The full video stays local — only compressed audio is uploaded.</div>
+          <ul id="pipelineSteps" class="pipeline">
+            <li data-step="connect"><span class="pl-ico">○</span><span class="pl-name">Connect to backend</span><span class="pl-msg"></span><div class="pl-bar"><div></div></div></li>
+            <li data-step="extract"><span class="pl-ico">○</span><span class="pl-name">Extract audio</span><span class="pl-msg"></span><div class="pl-bar"><div></div></div></li>
+            <li data-step="compress"><span class="pl-ico">○</span><span class="pl-name">Compress audio (mono 16 kHz)</span><span class="pl-msg"></span><div class="pl-bar"><div></div></div></li>
+            <li data-step="upload"><span class="pl-ico">○</span><span class="pl-name">Upload audio</span><span class="pl-msg"></span><div class="pl-bar"><div></div></div></li>
+            <li data-step="transcribe"><span class="pl-ico">○</span><span class="pl-name">Transcribe (Rev.ai, word-level)</span><span class="pl-msg"></span><div class="pl-bar"><div></div></div></li>
+            <li data-step="select"><span class="pl-ico">○</span><span class="pl-name">Select reel moments (Claude)</span><span class="pl-msg"></span><div class="pl-bar"><div></div></div></li>
+            <li data-step="cut"><span class="pl-ico">○</span><span class="pl-name">Cut reels (in/out references)</span><span class="pl-msg"></span><div class="pl-bar"><div></div></div></li>
+          </ul>
+          <div class="overlay-actions">
+            <button id="pipelineClose" class="btn" disabled>Close</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- CapCut-style export dialog -->
+      <div id="exportOverlay" class="overlay hidden">
+        <div class="overlay-card wide">
+          <div class="overlay-title">Export</div>
+
+          <div id="exportForm">
+            <div class="exp-row">
+              <label>Scope</label>
+              <div class="seg" id="expScope">
+                <button data-v="selected" class="active">Selected reel</button>
+                <button data-v="all">All reels</button>
+              </div>
+            </div>
+            <div class="exp-row">
+              <label>Resolution</label>
+              <div class="seg" id="expRes">
+                <button data-v="720p">720p</button>
+                <button data-v="1080p" class="active">1080p</button>
+                <button data-v="2K">2K</button>
+                <button data-v="4K">4K</button>
+              </div>
+            </div>
+            <div class="exp-row">
+              <label>Frame rate</label>
+              <div class="seg" id="expFps">
+                <button data-v="24">24</button>
+                <button data-v="25">25</button>
+                <button data-v="30" class="active">30</button>
+                <button data-v="50">50</button>
+                <button data-v="60">60</button>
+              </div>
+            </div>
+            <div class="exp-row">
+              <label>Quality</label>
+              <div class="seg" id="expQuality">
+                <button data-v="Lower">Lower</button>
+                <button data-v="Recommended" class="active">Recommended</button>
+                <button data-v="Higher">Higher</button>
+              </div>
+            </div>
+            <div class="exp-row">
+              <label>Format</label>
+              <div class="seg" id="expFormat">
+                <button data-v="mp4" class="active">MP4 (H.264)</button>
+                <button data-v="mov">MOV</button>
+              </div>
+            </div>
+            <div class="exp-row">
+              <label>Destination</label>
+              <div class="exp-dest">
+                <button id="expPickDir" class="btn sm">Choose folder…</button>
+                <span id="expDirPath" class="dim">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div id="exportProgress" class="hidden">
+            <div class="overlay-sub" id="expProgMsg">Starting…</div>
+            <div class="progress"><div id="expBar" class="progress-bar"></div></div>
+            <div class="progress-pct" id="expPct">0%</div>
+          </div>
+
+          <div class="overlay-actions">
+            <button id="exportCancel" class="btn">Close</button>
+            <button id="exportStart" class="btn primary" disabled>Export</button>
+          </div>
+        </div>
+      </div>
+
+      <footer class="statusbar">
+        <span id="status">Ready.</span>
+      </footer>
+    </div>
+
+    <script src="model.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>

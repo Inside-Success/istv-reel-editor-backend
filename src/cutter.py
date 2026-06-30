@@ -26,9 +26,11 @@ MAX_CONTEXT_BRIDGE_SEGMENTS = 4
 MAX_WORD_CONTINUATION = 6
 MAX_CONTEXT_HEAD_PREPENDS = 2
 
-# Extra seconds the cutter may exceed the target max so endings land on a
-# complete thought instead of a hard mid-sentence cut (soft duration window).
-REEL_END_TOLERANCE_SECONDS = 5.0
+# Extra seconds the cutter may exceed (or fall under) the target window so reels
+# land on a COMPLETE thought / open with full context instead of a hard
+# mid-sentence cut. This is a soft ceiling used only when the story demands it
+# (extending a dangling ending or prepending setup) — never a target length.
+REEL_END_TOLERANCE_SECONDS = 10.0
 
 
 def reel_max_seconds() -> float:

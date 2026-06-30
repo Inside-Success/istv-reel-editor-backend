@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# Virtual environment
+.venv/
+
 # Never commit large media outputs
 *.mp4
 *.mov

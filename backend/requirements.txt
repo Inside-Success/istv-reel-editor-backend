@@ -1,0 +1,4 @@
+# Backend-only deps (in addition to the repo's root requirements.txt, which
+# provides rev-ai, anthropic, python-dotenv, etc.)
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0

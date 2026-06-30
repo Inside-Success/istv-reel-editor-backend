@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 from export_pipeline import export_all_reels
 from paths import INPUT_DIR, OUTPUT_ROOT
 from src.analyzer import analyze_with_claude
+from src.cutter import REEL_END_TOLERANCE_SECONDS, reel_max_seconds
 from src.audio_processor import check_ffmpeg, compress_audio, extract_audio
 from src.source_video_paths import read_recorded_path, record_source_path
 from src.transcript_cleanup import correct_transcript_words
@@ -279,7 +280,12 @@ def main() -> None:
     )
     record_source_path(bundle, video, archive=False)
 
-    print(validate_summary(analysis, max_len=90.0), flush=True)
+    # Allow the soft tolerance (story-driven overruns) before flagging on length;
+    # dangling-ending / context checks stay strict regardless.
+    print(
+        validate_summary(analysis, max_len=reel_max_seconds() + REEL_END_TOLERANCE_SECONDS),
+        flush=True,
+    )
 
     print("\nExporting reels...", flush=True)
     outputs = export_all_reels(job_id, analysis, video, video.stem)
