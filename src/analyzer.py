@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import time
 
+import anthropic
 from anthropic import Anthropic
 from src.transcription import fmt_time
 from src.cutter import (
@@ -30,6 +32,57 @@ VALID_NUM_REELS = {3, 5, 10, 12}
 DEFAULT_NUM_REELS = 10
 MIN_REEL_DURATION = 15.0
 MAX_REEL_DURATION = MAX_REEL_SECONDS
+
+# Errors worth retrying: transient network/server issues, and malformed JSON —
+# Claude's sampling is non-deterministic, so a same-prompt retry often just works.
+#
+# Anthropic's SDK adds new *status-code-specific* subclasses of APIStatusError
+# over time (e.g. OverloadedError for HTTP 529, "Overloaded" — extremely common
+# under load with Opus) that are siblings of, not subclasses of,
+# InternalServerError — and several of them (OverloadedError,
+# ServiceUnavailableError, DeadlineExceededError) aren't even re-exported from
+# the public `anthropic` namespace, only from the private `anthropic._exceptions`
+# module. Naming individual classes is a losing game — a status-code check
+# against the public APIStatusError base class catches all of them, present
+# and future, without depending on SDK internals.
+_RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
+
+
+def _is_retryable_claude_error(exc: Exception) -> bool:
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code in _RETRYABLE_STATUS_CODES
+    if isinstance(exc, anthropic.APIConnectionError):  # covers APITimeoutError too (subclass)
+        return True
+    return isinstance(exc, (ValueError, json.JSONDecodeError))
+
+
+def _call_with_retries(fn, *, attempts: int = 6, base_delay: float = 2.0, max_delay: float = 30.0, progress_cb=None, label: str = "Claude call"):
+    """Run `fn()`, retrying on transient failures / malformed JSON with backoff.
+
+    A single dropped connection, one "Overloaded" response, or one bad JSON
+    sample used to fail the whole analysis job outright. Claude's output is
+    non-deterministic, so retrying the same prompt after a backoff frequently
+    succeeds without any other change. Attempts default higher than a typical
+    web-request retry because overload conditions on Anthropic's side can take
+    tens of seconds to clear — a long transcript (bigger source video, more
+    Claude calls) has more chances to hit one, so this needs to actually ride
+    it out rather than give up after a couple of quick tries.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_retryable_claude_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            if progress_cb:
+                progress_cb(f"{label} failed ({exc}); retrying in {delay:.0f}s ({attempt}/{attempts})...")
+            time.sleep(delay)
+    raise last_exc
 
 VALID_CONTENT_TYPES = frozenset({
     "emotional moment",
@@ -67,6 +120,11 @@ The transcript (in the user message) is pre-split into numbered SENTENCE segment
 [id] start=<sec.dec> end=<sec.dec> "one full sentence, verbatim"
 You SELECT WHOLE SEGMENTS BY ID, in playback order. You never invent timestamps and never start or end inside a segment. Times are resolved downstream from the ids you choose.
 
+# Who these reels are for
+ISTV is an interview-documentary company. This subject is a PAYING CLIENT — a founder, entrepreneur, lawyer, doctor, woman entrepreneur, veteran-turned-CEO, or similar professional — and THEY will post these reels to THEIR OWN social accounts. The reels are this person's personal brand, not generic clips. Two consequences:
+- Every reel must be something the subject would be PROUD to attach their name to and share: it should make them look credible, human, and worth following.
+- Across the set, a viewer should come away understanding both WHO this person is (their story, values) AND WHAT they do (their company, work, or field). Aim for at least a few reels that touch on their business or work — drawn only from what they actually said, never invented.
+
 # THE #1 RULE — cover the WHOLE documentary
 Do NOT take the best 2-3 minute segment and split it into 10 clips. Analyze the ENTIRE documentary and build {{NUM_REELS}} reels from DIFFERENT parts of it across the full runtime. Never rely on a single section or on where the energy spikes.
 
@@ -75,6 +133,10 @@ emotional moment · turning point · powerful statement · inspirational moment 
 Tag each reel with its primary "content_type" from that list.
 
 {{STORY_MODE_BLOCK}}
+
+# THE CLIENT-POST TEST (apply to every reel before you keep it)
+Before finalizing any reel, ask: "Would this client want to post this on their own page?" Keep it only if it makes them look credible, inspiring, or genuinely human. DROP any reel that makes them look incompetent, bitter, arrogant, negative about a named person, or off-message.
+Vulnerability is NOT disqualifying — a struggle, a low point, a moment they almost quit is exactly what a client is proud to post, AS LONG AS the reel resolves into strength, insight, or resilience by its end (not left on the low note). This gate decides WHICH moments qualify; the rules below decide HOW to build the ones that pass.
 
 # How to build each reel
 - A reel = an ordered list of segment ids forming a complete little arc (hook -> point -> payoff).
@@ -90,7 +152,7 @@ Tag each reel with its primary "content_type" from that list.
 # Score each reel (0-100, plus hook/flow/value out of 10).
 
 # For EACH reel, write the full marketing package:
-- title (Reel Title): short, engaging, scroll-stopping. Use curiosity/payoff formulas ("Why...", "How she...", "The [surprising] reason...", a stark number) — never a flat description. For series reels, prefix "Part N: ". <=60 chars.
+- title (Reel Title): short, engaging, scroll-stopping. Use curiosity/payoff formulas ("Why...", "How she...", "The [surprising] reason...", a stark number) — never a flat description. Frame the person as the story — a title the subject would proudly repost, never a stranger's hot take at their expense. For series reels, prefix "Part N: ". <=60 chars.
 - caption: social-media-ready — hook line, 1-2 lines of story, one soft CTA. Story-first and credible. NO hype/sales/MLM language ("change your life","DM me","financial freedom").
 - seo_title: search-optimized for Instagram / YouTube Shorts / TikTok. Front-load the searchable keywords (topic, name, niche). Distinct from the hooky Reel Title. <=70 chars.
 - best_posting_time: a specific day + time to publish (e.g., "Tuesday 11:00 AM"). Spread the {{NUM_REELS}} reels across ~2 weeks so the set forms a posting calendar; put the highest-scoring reels in prime windows (Tue-Thu late morning or 7-9 PM); vary the days; don't stack two reels in the same slot. For a series, schedule the parts on consecutive days/slots in order.
@@ -197,13 +259,17 @@ def analyze_with_claude(
     mode_label = "ON (4-5 part series)" if story_mode else "OFF (all standalone)"
     _log(progress_cb, f"Story mode {mode_label}")
     _log(progress_cb, f"Selecting {num_reels} reels with Claude ({model})...")
-    selection = select_reels(
-        segments,
-        story_mode=story_mode,
-        num_reels=num_reels,
-        model=model,
-        client=client,
-        segmented_text=segmented_text,
+    selection = _call_with_retries(
+        lambda: select_reels(
+            segments,
+            story_mode=story_mode,
+            num_reels=num_reels,
+            model=model,
+            client=client,
+            segmented_text=segmented_text,
+        ),
+        progress_cb=progress_cb,
+        label="Reel selection",
     )
     reels_raw = selection.get("reels") or []
     documentary_summary = str(selection.get("documentary_summary") or "").strip()
@@ -216,7 +282,11 @@ def analyze_with_claude(
     reels = reels[:num_reels]
 
     _log(progress_cb, "Crafting brand story...")
-    brand = _extract_brand_story(client, model, segmented_text, duration)
+    brand = _call_with_retries(
+        lambda: _extract_brand_story(client, model, segmented_text, duration),
+        progress_cb=progress_cb,
+        label="Brand story extraction",
+    )
 
     analysis = {
         "reels": reels,

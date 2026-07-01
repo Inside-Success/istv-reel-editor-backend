@@ -25,6 +25,9 @@ const RESOLUTIONS = {
   "1080p": { width: 1080, height: 1920 },
   "2K": { width: 1440, height: 2560 },
   "4K": { width: 2160, height: 3840 },
+  // Sentinel: export at the source's native resolution (crop only, no scale)
+  // instead of a fixed pixel target — see media.cjs exportReel.
+  Original: { width: "original", height: "original" },
 };
 const QUALITY = { Lower: "low", Recommended: "medium", Higher: "high" };
 // Faster x264 presets for snappier desktop exports (CRF still governs quality).
@@ -48,11 +51,18 @@ function spawnEnv() {
 
 /** Convert an app reel (in/out references + settings) into the CLI's reel spec. */
 function toExportReel(reel) {
+  // Multi-camera (optional): reel.settings.camera picks which camera this
+  // WHOLE reel pulls footage from — applied uniformly to every segment. The
+  // editor doesn't yet expose per-segment (per-cut) camera switching, but the
+  // export/media.cjs layer already supports it per-segment; a future editor UI
+  // could set `camera` per-span without any pipeline changes.
+  const reelCamera = reel.settings.camera || null;
   const editorCutSheet = reel.segments.map((s, idx) => ({
     order: idx + 1,
     role: s.role || (idx === 0 ? "HOOK" : idx === reel.segments.length - 1 ? "PAYOFF" : "BODY"),
     start_time_seconds: s.startSec,
     end_time_seconds: s.endSec,
+    ...(reelCamera ? { camera: reelCamera } : {}),
   }));
   const edits = reel.settings.subtitleEdits || {};
   const words = reel.words
@@ -71,7 +81,12 @@ function toExportReel(reel) {
     editor_cut_sheet: editorCutSheet,
     timestamped_words: words,
     options: {
-      cutFillersFromVideo: !!reel.settings.removeFillers,
+      // "Remove fillers" only hides filler words from the burned-in captions
+      // (always on server-side, see media.cjs hideFillersInSubtitles) and from
+      // the transcript editor preview (model.js) — it no longer cuts them out
+      // of the video, since word-level cuts risked exploding the ffmpeg command
+      // line on filler-heavy reels. reel.settings.removeFillers still drives the
+      // editor preview; there's nothing left for it to control at export time.
       cutSilences: !!reel.settings.removeSilences,
       canvas: {
         cropX: rf.cropX != null ? rf.cropX : 0.5,
@@ -89,18 +104,31 @@ function toExportReel(reel) {
  * Build the spec, spawn the exporter, stream progress events.
  * @returns {Promise<string[]>} exported file paths
  */
-function exportReels({ srcPath, outDir, reels, dialog, onEvent }) {
+function exportReels({ srcPath, outDir, reels, dialog, cameras, onEvent }) {
   return new Promise((resolve, reject) => {
+    const losslessAudio = !!dialog.losslessAudio;
+    // Raw PCM audio has poor compatibility inside an MP4 container — MOV (QuickTime)
+    // supports it properly, so force the container when lossless audio is requested.
+    const format = losslessAudio ? "mov" : dialog.format || "mp4";
+    const options = {
+      resolution: RESOLUTIONS[dialog.resolution] || RESOLUTIONS["1080p"],
+      fps: dialog.fps || "source",
+      quality: QUALITY[dialog.quality] || "medium",
+      encodePreset: PRESET[dialog.quality] || "faster",
+      losslessAudio,
+    };
+    // Multi-camera (optional): {camera_id: {path, offsetSec}} — omitted entirely
+    // for ordinary single-camera projects, which export exactly as before.
+    if (cameras && cameras.length) {
+      options.sources = Object.fromEntries(
+        cameras.map((c) => [c.id, { path: c.path, offsetSec: Number(c.offsetSec) || 0 }]),
+      );
+    }
     const spec = {
       source: srcPath,
       outDir,
-      format: dialog.format || "mp4",
-      options: {
-        resolution: RESOLUTIONS[dialog.resolution] || RESOLUTIONS["1080p"],
-        fps: dialog.fps || "source",
-        quality: QUALITY[dialog.quality] || "medium",
-        encodePreset: PRESET[dialog.quality] || "faster",
-      },
+      format,
+      options,
       reels: reels.map(toExportReel),
     };
 

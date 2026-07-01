@@ -5,6 +5,34 @@ const os = require("os");
 
 const FILLER_WORDS = new Set(["um", "uh", "umm", "uhh", "erm", "hmm", "ah", "like"]);
 
+const STALE_EXPORT_DIR_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6h
+
+// The normal cleanup path is the `finally` block in exportReel, but a hard kill
+// (OS-level terminate, e.g. from a subprocess timeout that doesn't let Node run
+// its finally) can leave an `istv-export-*` dir behind. Rather than a separate
+// cron/service, opportunistically sweep old ones on every export — best-effort,
+// never lets a sweep failure block the actual export.
+function cleanupStaleExportDirs() {
+  try {
+    const tmp = os.tmpdir();
+    const now = Date.now();
+    for (const name of fs.readdirSync(tmp)) {
+      if (!name.startsWith("istv-export-")) continue;
+      const full = path.join(tmp, name);
+      try {
+        const stat = fs.statSync(full);
+        if (stat.isDirectory() && now - stat.mtimeMs > STALE_EXPORT_DIR_MAX_AGE_MS) {
+          fs.rmSync(full, { recursive: true, force: true });
+        }
+      } catch (_) {
+        // Another process may be using it, or it vanished already — ignore.
+      }
+    }
+  } catch (_) {
+    // Best-effort only; never let sweep failures block a real export.
+  }
+}
+
 function run(cmd, args, options = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, { ...options, windowsHide: true });
@@ -107,55 +135,6 @@ function resequenceSegments(segments) {
     .map((s, i) => ({ ...s, order: i + 1 }));
 }
 
-function removeFillersFromSegments(segments, words, cutVideo) {
-  if (!cutVideo) return segments;
-  let removed = 0;
-  const next = [];
-  segments.forEach((segment) => {
-    const segStart = Number(segment.start_time_seconds) || 0;
-    const segEnd = Number(segment.end_time_seconds) || segStart;
-    const removals = (words || [])
-      .filter((w) => {
-        const clean = String(w.word || "")
-          .toLowerCase()
-          .replace(/[^a-z]/g, "");
-        const time = Number(w.time ?? w.start) || 0;
-        return FILLER_WORDS.has(clean) && time >= segStart && time <= segEnd;
-      })
-      .map((w) => {
-        const start = Number(w.time ?? w.start) || segStart;
-        return { start: Math.max(segStart, start - 0.06), end: Math.min(segEnd, start + 0.32) };
-      })
-      .sort((a, b) => a.start - b.start);
-
-    if (!removals.length) {
-      next.push(segment);
-      return;
-    }
-
-    let cursor = segStart;
-    removals.forEach((cut) => {
-      if (cut.start - cursor >= 0.18) {
-        next.push({
-          ...segment,
-          start_time_seconds: cursor,
-          end_time_seconds: cut.start,
-        });
-      }
-      cursor = Math.max(cursor, cut.end);
-      removed += 1;
-    });
-    if (segEnd - cursor >= 0.18) {
-      next.push({
-        ...segment,
-        start_time_seconds: cursor,
-        end_time_seconds: segEnd,
-      });
-    }
-  });
-  return resequenceSegments(next);
-}
-
 function removeSilencesFromSegments(segments, words, threshold = 0.45) {
   const next = [];
   segments.forEach((segment) => {
@@ -197,134 +176,6 @@ function removeSilencesFromSegments(segments, words, threshold = 0.45) {
     }
   });
   return resequenceSegments(next);
-}
-
-async function cutSegment(inputPath, outPath, start, end, isVideo = true, options = {}) {
-  const duration = Math.max(0.08, end - start);
-  const args = [
-    "-y",
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-ss",
-    `${start.toFixed(3)}`,
-    "-i",
-    inputPath,
-    "-t",
-    `${duration.toFixed(3)}`,
-  ];
-  if (isVideo) {
-    if (options.streamCopy) {
-      args.push("-c", "copy", "-avoid_negative_ts", "make_zero", "-map", "0");
-    } else if (options.highQuality) {
-      args.push(
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "14",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "256k",
-        "-ar",
-        "48000",
-        "-movflags",
-        "+faststart",
-      );
-    } else {
-      args.push(
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-      );
-    }
-  } else {
-    args.push("-c:a", "libmp3lame", "-b:a", "160k");
-  }
-  args.push(outPath);
-  await run("ffmpeg", args);
-}
-
-async function concatSegments(segmentPaths, outputPath, workDir) {
-  if (!segmentPaths.length) throw new Error("No segments to concat");
-  if (segmentPaths.length === 1) {
-    fs.copyFileSync(segmentPaths[0], outputPath);
-    return;
-  }
-  const listPath = path.join(workDir, "_concat.txt");
-  const names = segmentPaths.map((p) => path.basename(p));
-  fs.writeFileSync(
-    listPath,
-    names.map((n) => `file '${n.replace(/'/g, "'\\''")}'`).join("\n"),
-    "utf8",
-  );
-  await run("ffmpeg", [
-    "-y",
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    path.basename(listPath),
-    "-c",
-    "copy",
-    path.basename(outputPath),
-  ], { cwd: workDir });
-}
-
-async function renderReelPreview(sourcePath, segments, outputPath, options = {}) {
-  const workDir = path.dirname(outputPath);
-  let segs = resequenceSegments(segments || []);
-  const words = options.words || [];
-  const cutOptions = {
-    streamCopy: Boolean(options.streamCopy),
-    highQuality: Boolean(options.highQuality),
-  };
-
-  if (options.cutFillersFromVideo) {
-    segs = removeFillersFromSegments(segs, words, true);
-  }
-  if (options.cutSilences) {
-    segs = removeSilencesFromSegments(segs, words, options.silenceThreshold || 0.45);
-  }
-
-  const segPaths = [];
-  for (let i = 0; i < segs.length; i += 1) {
-    const s = Number(segs[i].start_time_seconds) || 0;
-    const e = Number(segs[i].end_time_seconds) || s;
-    const segOut = path.join(workDir, `_seg_${i.toString().padStart(3, "0")}.mp4`);
-    try {
-      await cutSegment(sourcePath, segOut, s, e, true, cutOptions);
-    } catch (error) {
-      if (cutOptions.streamCopy) {
-        await cutSegment(sourcePath, segOut, s, e, true, { highQuality: true });
-      } else {
-        throw error;
-      }
-    }
-    segPaths.push(segOut);
-  }
-  await concatSegments(segPaths, outputPath, workDir);
-  segPaths.forEach((p) => {
-    try {
-      fs.unlinkSync(p);
-    } catch (_) {}
-  });
-  return { outputPath, segments: segs };
 }
 
 function assColor(style) {
@@ -566,7 +417,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   return lines.join("\n");
 }
 
-function buildCropFilter(srcW, srcH, canvas, outW = 1080, outH = 1920) {
+function buildCropFilter(srcW, srcH, canvas, outW = 1080, outH = 1920, options = {}) {
   const targetAR = outW / outH;
   const srcAR = srcW / srcH;
   const zoom = Math.max(1, Number(canvas?.zoom) || 1);
@@ -588,6 +439,11 @@ function buildCropFilter(srcW, srcH, canvas, outW = 1080, outH = 1920) {
   const maxY = Math.max(0, srcH - cropH);
   const cx = Math.round(maxX * focusX);
   const cy = Math.round(maxY * focusY);
+  // "Original" resolution: crop only, no scale filter, so no pixel is invented (no upscale)
+  // and no source detail is downsampled away (no downscale) — the crop itself is native-res.
+  if (options.noScale) {
+    return `crop=${cropW}:${cropH}:${cx}:${cy},setsar=1`;
+  }
   return `crop=${cropW}:${cropH}:${cx}:${cy},scale=${outW}:${outH}:${scaleFlags},setsar=1`;
 }
 
@@ -601,7 +457,14 @@ function parseBitrate(value, fallback = "20M") {
   return `${amount}M`;
 }
 
-function buildExportEncodeArgs({ quality = "high", bitrate = "20M", fps, sourceFps = 30, presetOverride = null }) {
+function buildExportEncodeArgs({
+  quality = "high",
+  bitrate = "20M",
+  fps,
+  sourceFps = 30,
+  presetOverride = null,
+  losslessAudio = false,
+}) {
   const targetFps = fps && fps !== "source" ? Number(fps) : Math.round(sourceFps) || 30;
   const presets = {
     high: {
@@ -664,16 +527,13 @@ function buildExportEncodeArgs({ quality = "high", bitrate = "20M", fps, sourceF
   if (fps && fps !== "source") {
     videoArgs.push("-r", String(targetFps));
   }
-  const audioArgs = [
-    "-c:a",
-    "aac",
-    "-b:a",
-    cfg.audioBitrate,
-    "-ar",
-    "48000",
-    "-ac",
-    "2",
-  ];
+  // Lossless mode: PCM is uncompressed, so this removes the one remaining lossy
+  // step (AAC quantization). -ar/-ac still normalize to 48kHz stereo so the
+  // concat/amix filter graph stays consistent across segments and music tracks;
+  // that's an inaudible format match, not a compression loss.
+  const audioArgs = losslessAudio
+    ? ["-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2"]
+    : ["-c:a", "aac", "-b:a", cfg.audioBitrate, "-ar", "48000", "-ac", "2"];
   return { videoArgs, audioArgs, targetFps };
 }
 
@@ -685,7 +545,6 @@ async function exportReel(sourcePath, outputPath, payload) {
     canvas = {},
     musicPath,
     musicVolume = 0.25,
-    cutFillersFromVideo = false,
     cutSilences = false,
     hideFillersInSubtitles = false,
     captionStyle = "bold",
@@ -699,10 +558,24 @@ async function exportReel(sourcePath, outputPath, payload) {
     fps = "source",
     resolution = { width: 1080, height: 1920 },
     encodePreset = null,
+    losslessAudio = false,
+    // Multi-camera (optional, additive): { camera_id: { path, offsetSec } }.
+    // A segment with `camera` set to one of these keys pulls its footage from
+    // that camera's own file instead of `sourcePath`, seeking at
+    // `segment.start_time_seconds + offsetSec` — offsetSec converts a time on
+    // the single reference timeline (that all segments/captions are defined
+    // against) into that camera's own file timeline. Segments with no
+    // `camera`, or a `camera` not present here, use `sourcePath` unchanged —
+    // existing single-camera payloads need no changes at all.
+    sources = {},
   } = payload;
 
-  const workDir = path.join(os.tmpdir(), `istv-export-${Date.now()}`);
-  fs.mkdirSync(workDir, { recursive: true });
+  // mkdtempSync (not Date.now()-based naming) guarantees a unique dir even when
+  // several reels export concurrently and land in the same millisecond — a real
+  // possibility now that exports run in parallel, not a Date.now() collision would
+  // let two processes silently share (and race on) the same subs.ass file.
+  cleanupStaleExportDirs();
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "istv-export-"));
 
   try {
     const sourceProbe = await probeVideo(sourcePath);
@@ -711,23 +584,56 @@ async function exportReel(sourcePath, outputPath, payload) {
         "Source file has no video stream. Use the original documentary video file for export.",
       );
     }
-    const previewPath = path.join(workDir, "joined.mp4");
-    const { segments: processedSegs } = await renderReelPreview(sourcePath, segments, previewPath, {
-      words,
-      cutFillersFromVideo,
-      cutSilences,
-      // Re-encode cuts for frame-accurate audio — required for karaoke sync with Rev.ai timings
-      streamCopy: false,
-      highQuality: true,
-    });
 
-    const probe = await probeVideo(previewPath);
+    let segs = resequenceSegments(segments || []);
+
+    // Fail fast with a clear per-camera error rather than a cryptic ffmpeg
+    // failure deep in the filter graph if a secondary camera file is missing
+    // a video stream or otherwise broken.
+    const usedCameraIds = new Set(
+      segs.map((seg) => seg.camera).filter((camId) => camId && sources[camId]),
+    );
+    for (const camId of usedCameraIds) {
+      const camProbe = await probeVideo(sources[camId].path);
+      if (!camProbe.hasVideo) {
+        throw new Error(`Camera "${camId}" source file has no video stream: ${sources[camId].path}`);
+      }
+    }
+
+    // Filler words are hidden from the burned-in captions (hideFillersInSubtitles,
+    // below) but are no longer cut out of the video itself: word-level cuts could
+    // split one reel into 50-100+ tiny segments, which risked hitting the ffmpeg
+    // command-line length limit for filler-heavy reels. Silence removal is a much
+    // coarser cut (a handful of gaps, not per-word) so it's unaffected.
+    if (cutSilences) {
+      segs = removeSilencesFromSegments(segs, words || [], 0.45);
+    }
+    if (!segs.length) throw new Error("No segments to export");
+
     const assPath = path.join(workDir, "subs.ass");
     const playbackWords = words?.length
       ? words
       : (payload.playbackWords || []);
-    const outW = resolution.width || 1080;
-    const outH = resolution.height || 1920;
+
+    // "Original" resolution: keep the source's native pixel density. Crop to the
+    // 9:16 reel aspect using whichever source axis is the limiting one, then skip
+    // scaling entirely — no upscale (invented pixels) and no downscale (discarded detail).
+    const isOriginalRes = String(resolution.width).toLowerCase() === "original";
+    let outW = resolution.width || 1080;
+    let outH = resolution.height || 1920;
+    if (isOriginalRes) {
+      const targetAR = 9 / 16;
+      const srcAR = sourceProbe.width / sourceProbe.height;
+      if (srcAR > targetAR) {
+        outH = sourceProbe.height;
+        outW = Math.round(outH * targetAR);
+      } else {
+        outW = sourceProbe.width;
+        outH = Math.round(outW / targetAR);
+      }
+      outW -= outW % 2;
+      outH -= outH % 2;
+    }
     fs.writeFileSync(
       assPath,
       buildAssSubtitles(
@@ -744,40 +650,70 @@ async function exportReel(sourcePath, outputPath, payload) {
       "utf8",
     );
 
-    const crop = buildCropFilter(probe.width, probe.height, canvas, outW, outH);
+    // Known v1 limitation: crop geometry is computed once from the PRIMARY
+    // camera's resolution and reused for every segment's filter chain, even
+    // segments sourced from a different camera. Fine for a standardized studio
+    // where all cameras share the same resolution/framing (the assumption this
+    // multi-camera feature was built around); a secondary camera shot at a
+    // different resolution would get cropped using the primary's geometry.
+    const crop = buildCropFilter(sourceProbe.width, sourceProbe.height, canvas, outW, outH, {
+      noScale: isOriginalRes,
+    });
     const assEscaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
     const { videoArgs, audioArgs } = buildExportEncodeArgs({
       quality,
       bitrate,
       fps,
-      sourceFps: sourceProbe.fps || probe.fps || 30,
+      sourceFps: sourceProbe.fps || 30,
       presetOverride: encodePreset,
+      losslessAudio,
     });
 
-    const vf = `${crop},subtitles='${assEscaped}'`;
-    const args = [
-      "-y",
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      previewPath,
-    ];
+    // Single pass: fast per-segment seek + trim -> concat -> crop -> subtitles -> one final encode.
+    // Avoids the old cut-then-reencode-then-reencode-again pipeline (two full lossy passes).
+    const args = ["-y", "-hide_banner", "-loglevel", "error"];
+    const filterParts = [];
+    segs.forEach((seg, i) => {
+      const camSource = seg.camera && sources[seg.camera] ? sources[seg.camera] : null;
+      const segSourcePath = camSource ? camSource.path : sourcePath;
+      const offsetSec = camSource ? Number(camSource.offsetSec) || 0 : 0;
+      const refStart = Number(seg.start_time_seconds) || 0;
+      const refEnd = Number(seg.end_time_seconds) || refStart;
+      const start = refStart + offsetSec;
+      const end = refEnd + offsetSec;
+      if (start < 0) {
+        throw new Error(
+          `Camera "${seg.camera}" has no footage yet at reference time ${refStart.toFixed(3)}s ` +
+            `(camera starts ${(-offsetSec).toFixed(3)}s after the reference timeline).`,
+        );
+      }
+      const duration = Math.max(0.08, end - start);
+      args.push("-ss", start.toFixed(3), "-t", duration.toFixed(3), "-i", segSourcePath);
+      filterParts.push(`[${i}:v]setpts=PTS-STARTPTS[v${i}]`);
+      filterParts.push(`[${i}:a]asetpts=PTS-STARTPTS[a${i}]`);
+    });
 
-    if (musicPath && fs.existsSync(musicPath)) {
+    const hasMusic = Boolean(musicPath && fs.existsSync(musicPath));
+    const musicIndex = segs.length;
+    if (hasMusic) {
       args.push("-i", musicPath);
-      args.push(
-        "-filter_complex",
-        `[0:v]${vf}[v];[0:a]volume=1[a0];[1:a]volume=${musicVolume}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[a]`,
-        "-map",
-        "[v]",
-        "-map",
-        "[a]",
-      );
-    } else {
-      args.push("-vf", vf);
     }
 
+    const concatInputs = segs.map((_, i) => `[v${i}][a${i}]`).join("");
+    filterParts.push(`${concatInputs}concat=n=${segs.length}:v=1:a=1[vcat][acat]`);
+    filterParts.push(`[vcat]${crop}[vcrop]`);
+    filterParts.push(`[vcrop]subtitles='${assEscaped}'[vout]`);
+
+    let audioLabel = "[acat]";
+    if (hasMusic) {
+      filterParts.push(`[${musicIndex}:a]volume=${musicVolume}[am1]`);
+      filterParts.push("[acat]volume=1[am0]");
+      filterParts.push("[am0][am1]amix=inputs=2:duration=first:dropout_transition=0[aout]");
+      audioLabel = "[aout]";
+    }
+
+    args.push("-filter_complex", filterParts.join(";"));
+    args.push("-map", "[vout]", "-map", audioLabel);
     args.push(
       ...videoArgs,
       "-aspect",
@@ -789,7 +725,7 @@ async function exportReel(sourcePath, outputPath, payload) {
     );
 
     await run("ffmpeg", args);
-    return { outputPath, segments: processedSegs, quality, sourceFps: sourceProbe.fps };
+    return { outputPath, segments: segs, quality, sourceFps: sourceProbe.fps };
   } finally {
     try {
       fs.rmSync(workDir, { recursive: true, force: true });
@@ -829,10 +765,8 @@ module.exports = {
   probeVideo,
   extractAudio,
   compressAudio,
-  renderReelPreview,
   exportReel,
   buildAssSubtitles,
   createProxy,
-  removeFillersFromSegments,
   removeSilencesFromSegments,
 };

@@ -10,11 +10,16 @@ def transcribe_audio(
     progress_cb=None,
     *,
     remove_disfluencies: bool = False,
+    on_submitted=None,
 ) -> dict:
     """
     Submit audio to Rev.ai, poll until done, return structured verbatim transcript.
     Disfluencies (uh/um) are kept by default for timing fidelity; client may filter later.
     Raises RuntimeError on failure or timeout.
+
+    `on_submitted(revai_job_id)`, if given, fires right after Rev.ai accepts the job —
+    callers can persist that id so a crashed/restarted process can reattach to the
+    still-running Rev.ai job via `poll_transcription_job` instead of re-uploading audio.
     """
     client = apiclient.RevAiAPIClient(api_key)
 
@@ -28,7 +33,20 @@ def transcribe_audio(
         metadata="ISTV Reel Editor",
     )
     job_id = job.id
+    if on_submitted:
+        on_submitted(job_id)
     _log(progress_cb, f"Job submitted (ID: {job_id}). Waiting for transcription...")
+
+    return poll_transcription_job(job_id, api_key, progress_cb)
+
+
+def poll_transcription_job(job_id: str, api_key: str, progress_cb=None) -> dict:
+    """Poll an already-submitted Rev.ai job to completion and return the parsed transcript.
+
+    Split out from `transcribe_audio` so a resumed process can reattach to a job
+    submitted before a crash/restart, without re-uploading the source audio.
+    """
+    client = apiclient.RevAiAPIClient(api_key)
 
     elapsed = 0
     wait = 10  # start at 10 s, grow to 30 s

@@ -17,6 +17,13 @@ const state = {
   selectedReelId: null,
   undo: [],
   redo: [],
+  // Multi-camera (optional, additive) — see plan doc / theupdatelog.md.
+  // referenceAudioPath: the dedicated recorder file; only this is transcribed.
+  // cameras: [{ id, label, path, offsetSec, confidence }] — offsetSec/confidence
+  // are set once "Sync" runs (see runCameraSync). Empty for ordinary
+  // single-camera projects, which behave exactly as before.
+  referenceAudioPath: null,
+  cameras: [],
 };
 
 const editor = { previewMode: "916" }; // '916' (default) | 'fit'
@@ -54,9 +61,36 @@ function setStatus(msg) {
 
 // ── Open project ─────────────────────────────────────────────────────────────
 
+/** Clear everything scoped to the previously-open project before loading a new
+ * one — otherwise its reels, cameras, speaker name, and undo history would
+ * silently carry over and mix with the next project. */
+function resetProjectState() {
+  state.transcript = null;
+  state.reels = [];
+  state.selectedReelId = null;
+  state.undo = [];
+  state.redo = [];
+  state.referenceAudioPath = null;
+  state.cameras = [];
+
+  $("nameInput").value = "";
+  $("reelInspector").classList.add("hidden");
+  $("sourceInspector").classList.remove("hidden");
+  renderReelsPanel();
+  resetPipeline();
+  $("pipelineOverlay").classList.add("hidden");
+  $("exportOverlay").classList.add("hidden");
+  $("camerasOverlay").classList.add("hidden");
+  initHistory();
+}
+
 async function openProject() {
   const filePath = await window.api.openProjectDialog();
   if (!filePath) return;
+  if (dirty && !confirm("You have unsaved changes in the current project. Open a different project anyway?")) {
+    return;
+  }
+  resetProjectState();
   state.srcPath = filePath;
 
   $("proxyOverlay").classList.remove("hidden");
@@ -133,6 +167,7 @@ function loadMaster(res) {
   $("genBtn").disabled = !state.meta.hasAudio;
   $("genBtn").title = state.meta.hasAudio ? "" : "Source has no audio track";
   $("nameInput").disabled = false;
+  $("camerasBtn").disabled = false;
 }
 
 // ── Generate Reels pipeline (Phase 2 + 3) ──────────────────────────────────────
@@ -349,6 +384,8 @@ function openReelEditor(reel) {
 
   $("optZoom").value = reel.settings.reframe.zoom;
   $("optZoomVal").textContent = Number(reel.settings.reframe.zoom).toFixed(2) + "×";
+
+  populateReelCameraSelect(reel);
 
   const music = reel.settings.music;
   $("musicName").textContent = music ? music.name : "No track";
@@ -700,6 +737,7 @@ const exportState = {
   fps: "30",
   quality: "Recommended",
   format: "mp4",
+  losslessAudio: false,
   outDir: null,
 };
 
@@ -778,7 +816,9 @@ async function runExport() {
         fps: exportState.fps === "source" ? "source" : Number(exportState.fps),
         quality: exportState.quality,
         format: exportState.format,
+        losslessAudio: exportState.losslessAudio,
       },
+      cameras: state.cameras,
     });
     progressEl.classList.remove("indeterminate");
     $("expBar").style.width = "100%";
@@ -800,10 +840,16 @@ async function runExport() {
 async function saveProject() {
   if (!state.reels.length) return;
   const project = {
-    version: 1,
+    // v2 adds referenceAudioPath/cameras — both optional, so a v1 project
+    // (no cameras) round-trips identically. (Project *loading* isn't wired to
+    // any UI action yet in this app — window.api.loadProject exists but
+    // nothing calls it — so there's no restore path to update here either.)
+    version: 2,
     srcPath: state.srcPath,
     master: state.meta,
     reels: state.reels,
+    referenceAudioPath: state.referenceAudioPath,
+    cameras: state.cameras,
   };
   try {
     const p = await window.api.saveProject(project);
@@ -814,6 +860,196 @@ async function saveProject() {
     }
   } catch (e) {
     setStatus("Save failed: " + e.message);
+  }
+}
+
+// ── Multi-camera sync ───────────────────────────────────────────────────────
+
+/** Next unused single-letter camera id (A, B, C, ...). */
+function nextCameraId() {
+  const used = new Set(state.cameras.map((c) => c.id));
+  for (let code = 65; code < 91; code += 1) {
+    const id = String.fromCharCode(code);
+    if (!used.has(id)) return id;
+  }
+  return `CAM${state.cameras.length + 1}`;
+}
+
+function updateCamSyncEnabled() {
+  $("camSyncStart").disabled = !state.referenceAudioPath || !state.cameras.length;
+}
+
+function renderCamList() {
+  const box = $("camList");
+  box.innerHTML = "";
+  if (!state.cameras.length) {
+    box.innerHTML = '<span class="dim" style="font-size:12px">No cameras added yet.</span>';
+  }
+  state.cameras.forEach((cam) => {
+    const row = document.createElement("div");
+    row.className = "cam-row";
+
+    const label = document.createElement("span");
+    label.className = "cam-label";
+    label.textContent = `Cam ${cam.id}`;
+
+    const p = document.createElement("span");
+    p.className = "cam-path";
+    p.textContent = cam.path;
+    p.title = cam.path;
+
+    const offsetWrap = document.createElement("span");
+    offsetWrap.className = "cam-offset";
+    const offsetLabel = document.createElement("span");
+    offsetLabel.textContent = "offset";
+    const offsetInput = document.createElement("input");
+    offsetInput.type = "number";
+    offsetInput.step = "0.001";
+    offsetInput.value = cam.offsetSec != null ? cam.offsetSec : 0;
+    offsetInput.title = "Manual offset override (seconds) — camera_time = reference_time + offset";
+    offsetInput.addEventListener("change", () => {
+      cam.offsetSec = Number(offsetInput.value) || 0;
+      dirty = true;
+      updateHistoryButtons();
+    });
+    offsetWrap.appendChild(offsetLabel);
+    offsetWrap.appendChild(offsetInput);
+    const secLabel = document.createElement("span");
+    secLabel.textContent = "s";
+    offsetWrap.appendChild(secLabel);
+
+    const confidence = document.createElement("span");
+    if (cam.confidence != null) {
+      confidence.className = "cam-confidence " + (cam.confidence >= 10 ? "high" : "low");
+      confidence.textContent =
+        cam.confidence >= 10 ? `synced (conf ${cam.confidence.toFixed(1)})` : `low confidence (${cam.confidence.toFixed(1)}) — check manually`;
+    } else {
+      confidence.className = "cam-confidence low";
+      confidence.textContent = "not synced";
+    }
+
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "cam-remove";
+    removeBtn.title = "Remove camera";
+    removeBtn.textContent = "✕";
+    removeBtn.addEventListener("click", () => {
+      state.cameras = state.cameras.filter((c) => c.id !== cam.id);
+      renderCamList();
+      updateCamSyncEnabled();
+      if (state.selectedReelId != null) {
+        const reel = state.reels.find((r) => r.id === state.selectedReelId);
+        if (reel) populateReelCameraSelect(reel);
+      }
+      dirty = true;
+      updateHistoryButtons();
+    });
+
+    row.appendChild(label);
+    row.appendChild(p);
+    row.appendChild(offsetWrap);
+    row.appendChild(confidence);
+    row.appendChild(removeBtn);
+    box.appendChild(row);
+  });
+  updateCamSyncEnabled();
+}
+
+/** Rebuild the per-reel "Camera" picker options from state.cameras. */
+function populateReelCameraSelect(reel) {
+  const group = $("reelCameraGroup");
+  const select = $("reelCamera");
+  if (!state.cameras.length) {
+    group.classList.add("hidden");
+    return;
+  }
+  group.classList.remove("hidden");
+  select.innerHTML = "";
+  const defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "Primary (default)";
+  select.appendChild(defaultOpt);
+  state.cameras.forEach((cam) => {
+    const opt = document.createElement("option");
+    opt.value = cam.id;
+    opt.textContent = `Cam ${cam.id}`;
+    select.appendChild(opt);
+  });
+  select.value = reel.settings.camera || "";
+  select.onchange = () => {
+    reel.settings.camera = select.value || null;
+    commit();
+  };
+}
+
+function openCamerasDialog() {
+  $("camReferencePath").textContent = state.referenceAudioPath || "—";
+  renderCamList();
+  $("camSyncProgress").classList.add("hidden");
+  $("camerasOverlay").classList.remove("hidden");
+}
+
+async function pickReferenceAudio() {
+  const p = await window.api.pickReferenceAudio();
+  if (!p) return;
+  state.referenceAudioPath = p;
+  $("camReferencePath").textContent = p;
+  updateCamSyncEnabled();
+  dirty = true;
+  updateHistoryButtons();
+}
+
+async function addCamera() {
+  const p = await window.api.addCameraDialog();
+  if (!p) return;
+  state.cameras.push({ id: nextCameraId(), path: p, offsetSec: 0, confidence: null });
+  renderCamList();
+  if (state.selectedReelId != null) {
+    const reel = state.reels.find((r) => r.id === state.selectedReelId);
+    if (reel) populateReelCameraSelect(reel);
+  }
+  dirty = true;
+  updateHistoryButtons();
+}
+
+async function runCameraSync() {
+  if (!state.referenceAudioPath || !state.cameras.length) return;
+  $("camSyncStart").disabled = true;
+  $("camSyncProgress").classList.remove("hidden");
+  $("camSyncMsg").textContent = "Syncing…";
+  $("camSyncBar").style.width = "10%";
+
+  const off = window.api.onSyncEvent((e) => {
+    if (e.status === "syncing") {
+      $("camSyncMsg").textContent = `Syncing camera ${e.cameraId}…`;
+    } else if (e.status === "camera-done") {
+      const cam = state.cameras.find((c) => c.id === e.cameraId);
+      if (cam) {
+        cam.offsetSec = e.offsetSec;
+        cam.confidence = e.confidence;
+      }
+      renderCamList();
+      $("camSyncMsg").textContent = `Camera ${e.cameraId}: offset ${e.offsetSec.toFixed(3)}s`;
+    } else if (e.status === "error") {
+      $("camSyncMsg").textContent = "Error: " + e.message;
+    }
+  });
+
+  try {
+    await window.api.syncCameras({
+      referenceAudioPath: state.referenceAudioPath,
+      cameras: state.cameras.map((c) => ({ id: c.id, path: c.path })),
+    });
+    $("camSyncBar").style.width = "100%";
+    $("camSyncMsg").textContent = "Sync complete.";
+    setStatus("Cameras synced.");
+    dirty = true;
+    updateHistoryButtons();
+  } catch (err) {
+    $("camSyncMsg").textContent = "Sync failed: " + err.message;
+    setStatus("Camera sync failed: " + err.message);
+  } finally {
+    off();
+    updateCamSyncEnabled();
   }
 }
 
@@ -906,6 +1142,13 @@ function wire() {
     }
   });
 
+  // Cameras dialog
+  $("camerasBtn").addEventListener("click", openCamerasDialog);
+  $("camerasClose").addEventListener("click", () => $("camerasOverlay").classList.add("hidden"));
+  $("camPickReference").addEventListener("click", pickReferenceAudio);
+  $("camAdd").addEventListener("click", addCamera);
+  $("camSyncStart").addEventListener("click", runCameraSync);
+
   // Export dialog
   $("exportBtn").addEventListener("click", openExportDialog);
   $("exportCancel").addEventListener("click", () => $("exportOverlay").classList.add("hidden"));
@@ -915,6 +1158,20 @@ function wire() {
   wireSeg("expFps", "fps");
   wireSeg("expQuality", "quality");
   wireSeg("expFormat", "format");
+  $("expLossless").addEventListener("change", (e) => {
+    exportState.losslessAudio = e.target.checked;
+    // PCM audio isn't broadly compatible inside MP4 — steer the Format toggle to
+    // MOV while lossless is on so the UI matches what actually gets exported.
+    const formatSeg = $("expFormat");
+    formatSeg.querySelectorAll("button").forEach((b) => {
+      b.disabled = e.target.checked && b.dataset.v === "mp4";
+    });
+    if (e.target.checked && exportState.format !== "mov") {
+      formatSeg.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
+      formatSeg.querySelector('button[data-v="mov"]').classList.add("active");
+      exportState.format = "mov";
+    }
+  });
   $("expPickDir").addEventListener("click", async () => {
     const dir = await window.api.pickExportDir();
     if (dir) {

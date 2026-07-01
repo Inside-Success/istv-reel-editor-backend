@@ -36,4 +36,13 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.on(C.EXPORT_EVENT, handler);
     return () => ipcRenderer.removeListener(C.EXPORT_EVENT, handler);
   },
+
+  pickReferenceAudio: () => ipcRenderer.invoke(C.PICK_REFERENCE_AUDIO),
+  addCameraDialog: () => ipcRenderer.invoke(C.ADD_CAMERA_DIALOG),
+  syncCameras: (args) => ipcRenderer.invoke(C.SYNC_CAMERAS, args),
+  onSyncEvent: (cb) => {
+    const handler = (_evt, e) => cb(e);
+    ipcRenderer.on(C.SYNC_EVENT, handler);
+    return () => ipcRenderer.removeListener(C.SYNC_EVENT, handler);
+  },
 });

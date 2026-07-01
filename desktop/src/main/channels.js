@@ -15,4 +15,9 @@ module.exports = {
   PICK_EXPORT_DIR: "export:pick-dir",
   EXPORT_REELS: "export:run",
   EXPORT_EVENT: "export:event",
+
+  PICK_REFERENCE_AUDIO: "cameras:pick-reference-audio",
+  ADD_CAMERA_DIALOG: "cameras:add-camera-dialog",
+  SYNC_CAMERAS: "cameras:sync",
+  SYNC_EVENT: "cameras:sync-event",
 };

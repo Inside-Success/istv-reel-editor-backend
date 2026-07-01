@@ -19,6 +19,7 @@
           <button id="undoBtn" class="btn icon" title="Undo (Ctrl+Z)" disabled>↶</button>
           <button id="redoBtn" class="btn icon" title="Redo (Ctrl+Y)" disabled>↷</button>
           <button id="saveBtn" class="btn" title="Save project (Ctrl+S)" disabled>Save</button>
+          <button id="camerasBtn" class="btn" disabled>Cameras…</button>
           <button id="exportBtn" class="btn primary" disabled>Export…</button>
         </div>
         <div class="phase-badge">Phase&nbsp;1 · Source</div>
@@ -126,6 +127,12 @@
                 </div>
               </div>
 
+              <div class="insp-group hidden" id="reelCameraGroup">
+                <div class="ig-head">Camera</div>
+                <select id="reelCamera" class="ig-select"></select>
+                <div class="ig-hint">Applies to this whole reel. Sync cameras first in the Cameras panel.</div>
+              </div>
+
               <div class="insp-group">
                 <div class="ig-head">9:16 Reframe</div>
                 <div class="ig-row"><span>Zoom</span><input type="range" id="optZoom" min="1" max="3" step="0.05" value="1" /><span id="optZoomVal" class="dim">1.00×</span></div>
@@ -198,6 +205,7 @@
                 <button data-v="1080p" class="active">1080p</button>
                 <button data-v="2K">2K</button>
                 <button data-v="4K">4K</button>
+                <button data-v="Original">Original</button>
               </div>
             </div>
             <div class="exp-row">
@@ -226,6 +234,13 @@
               </div>
             </div>
             <div class="exp-row">
+              <label>Audio</label>
+              <label class="exp-checkbox">
+                <input type="checkbox" id="expLossless" />
+                Lossless (uncompressed PCM — forces MOV, larger files)
+              </label>
+            </div>
+            <div class="exp-row">
               <label>Destination</label>
               <div class="exp-dest">
                 <button id="expPickDir" class="btn sm">Choose folder…</button>
@@ -243,6 +258,42 @@
           <div class="overlay-actions">
             <button id="exportCancel" class="btn">Close</button>
             <button id="exportStart" class="btn primary" disabled>Export</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Multi-camera sync dialog -->
+      <div id="camerasOverlay" class="overlay hidden">
+        <div class="overlay-card wide">
+          <div class="overlay-title">Cameras</div>
+          <div class="overlay-sub">
+            Add each camera's file plus a reference audio recording (the dedicated
+            recorder track — this is what gets transcribed). Sync computes each
+            camera's time offset from the reference via audio cross-correlation.
+          </div>
+
+          <div class="exp-row">
+            <label>Reference audio</label>
+            <div class="exp-dest">
+              <button id="camPickReference" class="btn sm">Choose file…</button>
+              <span id="camReferencePath" class="dim">—</span>
+            </div>
+          </div>
+
+          <div class="insp-group" style="border-top: none; margin-top: 12px; padding-top: 0;">
+            <div class="ig-head">Camera files</div>
+            <div id="camList"></div>
+            <button id="camAdd" class="btn sm" style="margin-top: 8px;">Add camera…</button>
+          </div>
+
+          <div id="camSyncProgress" class="hidden">
+            <div class="overlay-sub" id="camSyncMsg">Syncing…</div>
+            <div class="progress"><div id="camSyncBar" class="progress-bar"></div></div>
+          </div>
+
+          <div class="overlay-actions">
+            <button id="camerasClose" class="btn">Close</button>
+            <button id="camSyncStart" class="btn primary" disabled>Sync</button>
           </div>
         </div>
       </div>

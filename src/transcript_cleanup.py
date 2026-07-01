@@ -8,11 +8,31 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
+import anthropic
 from anthropic import Anthropic
 
 CHUNK_TOKENS = 220
 CONTEXT_TOKENS = 25
+
+# A transient network blip (or an Anthropic-side "Overloaded" 529, common
+# under load) shouldn't silently skip a whole chunk's worth of corrections —
+# retry those specifically before giving up on the chunk. Status-code check
+# against the public APIStatusError base class (rather than naming individual
+# subclasses like OverloadedError, which isn't even part of the public
+# `anthropic` namespace) so new transient-error subclasses are caught without
+# code changes — see the matching helper in src/analyzer.py.
+_RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
+_CHUNK_RETRY_ATTEMPTS = 4
+_CHUNK_RETRY_DELAY = 2.0
+_CHUNK_RETRY_MAX_DELAY = 20.0
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code in _RETRYABLE_STATUS_CODES
+    return isinstance(exc, anthropic.APIConnectionError)  # covers APITimeoutError too (subclass)
 
 _CLEAN_SYSTEM = """You fix automatic-speech-recognition (ASR) errors in an interview transcript.
 
@@ -75,19 +95,34 @@ def correct_transcript_words(
             f"{hint}Correct ONLY indices {start}..{end - 1} (surrounding lines are context).\n\n"
             f"{numbered}"
         )
-        try:
-            resp = client.messages.create(
-                model=model,
-                max_tokens=2000,
-                system=_CLEAN_SYSTEM,
-                messages=[{"role": "user", "content": user}],
-            )
-            raw = "".join(b.text for b in resp.content if hasattr(b, "text"))
-            fixes = _parse_json(raw).get("fixes") or []
-        except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
-            if progress_cb:
-                progress_cb(f"transcript cleanup chunk {start}-{end} skipped: {exc}")
+        fixes = []
+        last_exc: Exception | None = None
+        for retry in range(_CHUNK_RETRY_ATTEMPTS + 1):
+            try:
+                resp = client.messages.create(
+                    model=model,
+                    max_tokens=2000,
+                    system=_CLEAN_SYSTEM,
+                    messages=[{"role": "user", "content": user}],
+                )
+                raw = "".join(b.text for b in resp.content if hasattr(b, "text"))
+                fixes = _parse_json(raw).get("fixes") or []
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001 - non-retryable path falls through below
+                if not _is_retryable(exc):
+                    last_exc = exc
+                    break
+                last_exc = exc
+                if retry < _CHUNK_RETRY_ATTEMPTS:
+                    delay = min(_CHUNK_RETRY_MAX_DELAY, _CHUNK_RETRY_DELAY * (retry + 1))
+                    if progress_cb:
+                        progress_cb(f"transcript cleanup chunk {start}-{end}: {exc}; retrying in {delay:.0f}s...")
+                    time.sleep(delay)
+        if last_exc is not None:
             fixes = []
+            if progress_cb:
+                progress_cb(f"transcript cleanup chunk {start}-{end} skipped: {last_exc}")
 
         for fix in fixes:
             try:

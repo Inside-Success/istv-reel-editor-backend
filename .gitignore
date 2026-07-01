@@ -21,3 +21,6 @@ generated_data/*/
 # Source videos stay local
 input/*
 !input/.gitkeep
+
+# Local durable job registry (backend/job_store.py)
+backend/jobs.db

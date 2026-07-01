@@ -10,6 +10,7 @@ const ffmpeg = require("./ffmpeg");
 const backend = require("./backend");
 const { toReferenceReels } = require("./reels");
 const exporter = require("./export");
+const camSync = require("./sync");
 
 const isSmoke = process.argv.includes("--smoke");
 
@@ -299,7 +300,7 @@ ipcMain.handle(C.PICK_EXPORT_DIR, async () => {
   return res.filePaths[0];
 });
 
-ipcMain.handle(C.EXPORT_REELS, async (evt, { srcPath, outDir, reels, dialog: dlg }) => {
+ipcMain.handle(C.EXPORT_REELS, async (evt, { srcPath, outDir, reels, dialog: dlg, cameras }) => {
   if (!srcPath || !fs.existsSync(srcPath)) throw new Error(`Master not found: ${srcPath}`);
   if (!outDir) throw new Error("No export destination chosen");
   if (!reels || !reels.length) throw new Error("No reels to export");
@@ -309,9 +310,54 @@ ipcMain.handle(C.EXPORT_REELS, async (evt, { srcPath, outDir, reels, dialog: dlg
     outDir,
     reels,
     dialog: dlg,
+    cameras,
     onEvent: (e) => evt.sender.send(C.EXPORT_EVENT, e),
   });
   return { outputs };
+});
+
+// ── Multi-camera sync ────────────────────────────────────────────────────────
+
+ipcMain.handle(C.PICK_REFERENCE_AUDIO, async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: "Add reference audio recorder file",
+    properties: ["openFile"],
+    filters: [
+      { name: "Audio", extensions: ["mp3", "m4a", "aac", "wav", "ogg", "flac"] },
+      { name: "All files", extensions: ["*"] },
+    ],
+  });
+  if (res.canceled || !res.filePaths.length) return null;
+  return res.filePaths[0];
+});
+
+ipcMain.handle(C.ADD_CAMERA_DIALOG, async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: "Add camera video file",
+    properties: ["openFile"],
+    filters: [
+      { name: "Video", extensions: ["mp4", "mov", "mkv", "avi", "webm", "m4v"] },
+      { name: "All files", extensions: ["*"] },
+    ],
+  });
+  if (res.canceled || !res.filePaths.length) return null;
+  return res.filePaths[0];
+});
+
+ipcMain.handle(C.SYNC_CAMERAS, async (evt, { referenceAudioPath, cameras }) => {
+  if (!referenceAudioPath || !fs.existsSync(referenceAudioPath)) {
+    throw new Error(`Reference audio not found: ${referenceAudioPath}`);
+  }
+  if (!cameras || !cameras.length) throw new Error("No cameras to sync");
+  for (const cam of cameras) {
+    if (!fs.existsSync(cam.path)) throw new Error(`Camera "${cam.id}" file not found: ${cam.path}`);
+  }
+  const results = await camSync.syncCameras({
+    referenceAudioPath,
+    cameras,
+    onEvent: (e) => evt.sender.send(C.SYNC_EVENT, e),
+  });
+  return { results };
 });
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
