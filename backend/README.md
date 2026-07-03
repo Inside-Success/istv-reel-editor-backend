@@ -36,3 +36,27 @@ The desktop app points at `http://127.0.0.1:8722` by default; override with the
 Reads `REVAI_API_KEY` and `CLAUDE_API_KEY` from the repo root `.env`. In a real
 deployment, set these as server environment variables and restrict CORS to the
 app's origin.
+
+## Deploying (Render)
+
+This service holds state in memory and on local disk (background job threads,
+`job_store.py`'s SQLite file) so it needs a host that keeps one process running
+continuously — not a serverless platform like Vercel. See the root
+[`Dockerfile`](../Dockerfile) and [`render.yaml`](../render.yaml).
+
+1. Push this repo to GitHub (or GitLab).
+2. In Render: **New → Blueprint**, point it at the repo — it reads `render.yaml`
+   and provisions the web service plus a 1 GB disk for the job store.
+3. Set `REVAI_API_KEY` and `CLAUDE_API_KEY` in the service's **Environment** tab
+   (left blank in `render.yaml` on purpose — never commit real keys).
+4. Once live, point the desktop app at it by building with
+   `ISTV_BACKEND_URL=https://<your-service>.onrender.com`.
+
+`JOB_STORE_DIR` (set to `/var/data` in `render.yaml`) puts `jobs.db` on the
+mounted disk so in-flight jobs survive a redeploy — without it, the container's
+own filesystem is wiped on every deploy. Local dev doesn't set this and falls
+back to `backend/jobs.db`, as before.
+
+Prefer Fly.io or Railway instead? Same Dockerfile works there — Fly needs a
+`fly.toml` + volume, Railway can build the Dockerfile directly with no extra
+config. Ask and I'll add the corresponding file.

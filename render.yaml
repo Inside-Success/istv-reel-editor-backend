@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: istv-reel-editor-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: JOB_STORE_DIR
+        value: /var/data
+      - key: REVAI_API_KEY
+        sync: false
+      - key: CLAUDE_API_KEY
+        sync: false
+    disks:
+      - name: job-store
+        mountPath: /var/data
+        sizeGB: 1

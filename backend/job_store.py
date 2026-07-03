@@ -16,12 +16,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / "jobs.db"
+# JOB_STORE_DIR lets a production host point this at a mounted persistent disk
+# (a plain container filesystem is wiped on every redeploy, which would defeat
+# the crash-recovery this module exists for). Defaults to the backend folder
+# for local dev, where no such disk exists.
+_STORE_DIR = Path(os.environ["JOB_STORE_DIR"]) if os.environ.get("JOB_STORE_DIR") else Path(__file__).resolve().parent
+_STORE_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = _STORE_DIR / "jobs.db"
 
 _log = logging.getLogger(__name__)
 _lock = threading.Lock()

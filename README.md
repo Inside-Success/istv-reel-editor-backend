@@ -1,14 +1,18 @@
 # The Reels Tool Logic
 
 Turn a long-form documentary into short-form 9:16 karaoke reels. This repo has
-**three components** that share the same core pipeline (`src/`) and FFmpeg engine
+**two components** that share the same core pipeline (`src/`) and FFmpeg engine
 (`export/`):
 
 | Component | What it is | Folder |
 |-----------|-----------|--------|
 | **CLI tool** | Drop a video in `input/`, run one command, get reels in `generated_data/`. | repo root (`generate_reels.py`) |
 | **Backend** | FastAPI service: Rev.ai transcription + Claude reel selection. Holds the API keys. | [`backend/`](backend/) |
-| **Desktop editor** | Cross-platform Electron app (Premiere-style) to edit + export reels. Only compressed audio leaves the machine. | [`desktop/`](desktop/) |
+
+The **desktop editor** (Electron app to edit + export reels) now lives in its own
+standalone repo — `istv-reel-editor-desktop`, a sibling folder — since it vendors
+its own copy of the export/sync engine rather than depending on this repo's
+layout. See that repo's README for setup and building a Windows installer.
 
 ## First-time setup (all components)
 
@@ -26,15 +30,14 @@ Turn a long-form documentary into short-form 9:16 karaoke reels. This repo has
 ```bash
 python -m uvicorn backend.app:app --port 8722
 ```
+See [`backend/README.md`](backend/README.md) for deployment (Render) details.
 
 ### Run the desktop editor
-```bash
-cd desktop
-npm install
-npm start        # opens the editor window
-```
-The app talks to the backend at `http://127.0.0.1:8722` (override with `ISTV_BACKEND_URL`).
-See [`desktop/README.md`](desktop/README.md) and [`backend/README.md`](backend/README.md) for details.
+See the `istv-reel-editor-desktop` repo (sibling folder) — `npm install && npm start`.
+It talks to the backend at `http://127.0.0.1:8722` by default (override with
+`ISTV_BACKEND_URL`) and vendors its own copy of `export_cli.py` / `sync_cameras_cli.py`
+/ `src/*.py`, so changes to this repo's pipeline code (`src/`, `export_pipeline.py`)
+don't automatically reach it — resync `engine/` there if you change the shared logic.
 
 ---
 
