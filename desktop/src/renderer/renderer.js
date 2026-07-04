@@ -78,6 +78,7 @@ function resetProjectState() {
   $("sourceInspector").classList.remove("hidden");
   renderReelsPanel();
   resetPipeline();
+  $("pipelineRetrySelect").classList.add("hidden");
   $("pipelineOverlay").classList.add("hidden");
   $("exportOverlay").classList.add("hidden");
   $("camerasOverlay").classList.add("hidden");
@@ -204,12 +205,35 @@ function applyPipelineEvent(e) {
     msg.textContent = `${e.message || "Transcribing…"} (${e.elapsed}s)`;
   }
   if (e.status === "done") li.querySelector(".pl-bar > div").style.width = "100%";
+
+  // Cache the transcript the moment transcription succeeds — if a later step
+  // (reel selection) fails, this is what lets "Retry selection" skip straight
+  // back to Claude instead of re-running extract/compress/upload/transcribe
+  // (the slow, Rev.ai-billed part) from scratch.
+  if (e.step === "transcribe" && e.status === "done" && e.transcript) {
+    state.transcript = e.transcript;
+  }
+}
+
+function applyReelSelectionResult(res) {
+  state.transcript = res.transcript;
+  state.reels = res.reels || [];
+  // Derive each reel's subtitle words from the full transcript so trimming works.
+  state.reels.forEach(recomputeReelWords);
+  initHistory();
+  renderReelsPanel();
+  setStatus(
+    `${state.reels.length} reels ready from ${res.transcript.word_count.toLocaleString()} words. ` +
+      `Click a reel to load it.`
+  );
+  if (state.reels.length) selectReel(state.reels[0].id);
 }
 
 async function generateReels() {
   if (!state.srcPath) return;
   $("genBtn").disabled = true;
   resetPipeline();
+  $("pipelineRetrySelect").classList.add("hidden");
   $("pipelineOverlay").classList.remove("hidden");
   setStatus("Generating reels…");
 
@@ -217,23 +241,38 @@ async function generateReels() {
   try {
     const name = $("nameInput").value.trim();
     const res = await window.api.generateReels(state.srcPath, name);
-    state.transcript = res.transcript;
-    state.reels = res.reels || [];
-    // Derive each reel's subtitle words from the full transcript so trimming works.
-    state.reels.forEach(recomputeReelWords);
-    initHistory();
-    renderReelsPanel();
-    setStatus(
-      `${state.reels.length} reels ready from ${res.transcript.word_count.toLocaleString()} words. ` +
-        `Click a reel to load it.`
-    );
-    if (state.reels.length) selectReel(state.reels[0].id);
+    applyReelSelectionResult(res);
   } catch (err) {
     setStatus("Generate Reels failed: " + err.message);
+    // Transcription already succeeded (cached via the "transcribe" pipeline
+    // event) even though something after it failed — offer to resume from
+    // there instead of forcing a full re-run through Rev.ai.
+    if (state.transcript) {
+      $("pipelineRetrySelect").classList.remove("hidden");
+    }
   } finally {
     off();
     $("pipelineClose").disabled = false;
     $("genBtn").disabled = !state.meta || !state.meta.hasAudio;
+  }
+}
+
+async function retrySelectionOnly() {
+  if (!state.transcript) return;
+  $("pipelineRetrySelect").disabled = true;
+  setStatus("Retrying reel selection from the existing transcript…");
+
+  const off = window.api.onPipelineEvent(applyPipelineEvent);
+  try {
+    const name = $("nameInput").value.trim();
+    const res = await window.api.selectReelsOnly(state.transcript, name);
+    applyReelSelectionResult(res);
+    $("pipelineRetrySelect").classList.add("hidden");
+  } catch (err) {
+    setStatus("Retry failed: " + err.message);
+  } finally {
+    off();
+    $("pipelineRetrySelect").disabled = false;
   }
 }
 
@@ -252,6 +291,7 @@ function renderReelsPanel() {
     card.dataset.id = reel.id;
     card.innerHTML =
       `<div class="rc-top"><span class="rc-rank">#${reel.rank}</span>` +
+      (reel.isBrandReel ? `<span class="rc-brand">BRAND</span>` : "") +
       `<span class="rc-dur">${reel.durationSec.toFixed(1)}s</span></div>` +
       `<div class="rc-title"></div>` +
       `<div class="rc-type"></div>`;
@@ -1059,6 +1099,7 @@ function wire() {
   $("openBtn").addEventListener("click", openProject);
   $("openBtn2").addEventListener("click", openProject);
   $("genBtn").addEventListener("click", generateReels);
+  $("pipelineRetrySelect").addEventListener("click", retrySelectionOnly);
   $("pipelineClose").addEventListener("click", () =>
     $("pipelineOverlay").classList.add("hidden")
   );

@@ -157,6 +157,36 @@ ipcMain.handle(C.GENERATE_PROXY, async (evt, srcPath) => {
 });
 
 /**
+ * Reel selection (Claude) + cut into non-destructive in/out references.
+ * Split out from the full pipeline so a transcript already in hand (because
+ * transcription succeeded but selection failed, or the desktop cached it from
+ * a prior run) can retry from here instead of re-running extract/compress/
+ * upload/transcribe against Rev.ai again — that step already cost real time
+ * and, for Rev.ai, real money, and shouldn't be redone just because the LLM
+ * call after it failed.
+ */
+async function selectAndCut(transcript, speakerName, emit) {
+  emit("select", "active", { message: "Selecting reel moments…" });
+  const analysis = await backend.selectReels(transcript, speakerName || "", 15, {
+    onStatus: (s) => emit("select", "active", { message: s.message }),
+  });
+  const n = (analysis.reels || []).length;
+  emit("select", "done", { message: `${n} reels selected` });
+
+  emit("cut", "active", { progress: 0 });
+  const reels = toReferenceReels(analysis);
+  reels.forEach((reel, i) => {
+    emit("cut", "active", {
+      progress: (i + 1) / reels.length,
+      message: `Reel ${i + 1}/${reels.length}: ${reel.title}`,
+    });
+  });
+  emit("cut", "done", { message: `${reels.length} reels cut (in/out references)` });
+
+  return { analysis, reels };
+}
+
+/**
  * Phase 2 pipeline: extract audio -> compress -> upload ONLY audio -> Rev.ai
  * word-level transcript. Emits granular per-step events so the renderer's
  * pipeline panel shows live progress and any failure surfaces clearly.
@@ -243,10 +273,16 @@ ipcMain.handle(C.GENERATE_REELS, async (evt, srcPath, name) => {
     if (!transcript || transcript.word_count == null) {
       throw new Error("Backend returned no transcript");
     }
+    // Include the transcript on the "done" event itself (not just the final
+    // return value) so the renderer caches it the moment transcription
+    // succeeds — if the LLM selection step below fails, that transcript is
+    // still recoverable for a retry via SELECT_REELS_ONLY, without redoing
+    // extract/compress/upload/transcribe (the expensive, Rev.ai-billed part).
     emit("transcribe", "done", {
       message: `${transcript.word_count.toLocaleString()} words · ${Math.round(
         transcript.duration
       )}s`,
+      transcript,
     });
   } catch (e) {
     return fail("transcribe", e);
@@ -254,31 +290,39 @@ ipcMain.handle(C.GENERATE_REELS, async (evt, srcPath, name) => {
 
   cleanupDir(workDir);
 
-  // Step 5: reel selection (Claude) — returns cut instructions.
-  emit("select", "active", { message: "Selecting reel moments…" });
+  // Steps 5-6: reel selection (Claude) + cut into in/out references.
   let analysis;
+  let reels;
   try {
-    analysis = await backend.selectReels(transcript, speakerName || "", 10, {
-      onStatus: (s) => emit("select", "active", { message: s.message }),
-    });
-    const n = (analysis.reels || []).length;
-    emit("select", "done", { message: `${n} reels selected` });
+    ({ analysis, reels } = await selectAndCut(transcript, speakerName, emit));
   } catch (e) {
     return fail("select", e);
   }
 
-  // Step 6: cut into non-destructive in/out references — step through each reel.
-  emit("cut", "active", { progress: 0 });
-  const reels = toReferenceReels(analysis);
-  reels.forEach((reel, i) => {
-    emit("cut", "active", {
-      progress: (i + 1) / reels.length,
-      message: `Reel ${i + 1}/${reels.length}: ${reel.title}`,
-    });
-  });
-  emit("cut", "done", { message: `${reels.length} reels cut (in/out references)` });
-
   return { transcript, analysis, reels };
+});
+
+/**
+ * Retry reel selection from an already-obtained transcript, skipping
+ * extract/compress/upload/transcribe entirely. Used when GENERATE_REELS
+ * failed at or after the "select" step but transcription itself succeeded.
+ */
+ipcMain.handle(C.SELECT_REELS_ONLY, async (evt, transcript, name) => {
+  const speakerName = String(name || "").trim();
+  const emit = (step, status, extra = {}) =>
+    evt.sender.send(C.PIPELINE_EVENT, { step, status, ...extra });
+
+  if (!transcript || transcript.word_count == null) {
+    throw new Error("No transcript to select reels from");
+  }
+
+  try {
+    const { analysis, reels } = await selectAndCut(transcript, speakerName, emit);
+    return { transcript, analysis, reels };
+  } catch (e) {
+    emit("select", "error", { message: e.message });
+    throw e;
+  }
 });
 
 function cleanupDir(dir) {

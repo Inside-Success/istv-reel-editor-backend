@@ -54,6 +54,7 @@ function toReferenceReels(analysis) {
       seoTitle: String(r.seo_title || ""),
       hashtags: Array.isArray(r.hashtags) ? r.hashtags : [],
       contentType: String(r.content_type || ""),
+      isBrandReel: Boolean(r.is_brand_reel),
       score: num(r.score),
       whyItWorks: String(r.why_it_works || r.theme || ""),
       spokenHook: String(r.spoken_hook || ""),

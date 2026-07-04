@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld("api", {
   },
 
   generateReels: (srcPath, name) => ipcRenderer.invoke(C.GENERATE_REELS, srcPath, name),
+  selectReelsOnly: (transcript, name) => ipcRenderer.invoke(C.SELECT_REELS_ONLY, transcript, name),
   onPipelineEvent: (cb) => {
     const handler = (_evt, e) => cb(e);
     ipcRenderer.on(C.PIPELINE_EVENT, handler);

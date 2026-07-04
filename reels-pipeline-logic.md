@@ -48,6 +48,15 @@ word entry. Disfluencies ("um"/"uh") are **kept** by default — `remove_disflue
 defaults to `False` — so filler removal happens later, in the UI/caption layer,
 not by discarding data at transcription time.
 
+**Non-speech event tags are dropped here too.** Rev.ai emits laughter, cough,
+crosstalk, etc. as bracket-wrapped "text" elements (`<laugh>`, `[cough]`).
+`_is_non_speech_tag()` matches anything fully wrapped in `<...>`/`[...]` and
+excludes it from the word list entirely — this is the single point every
+downstream consumer (sentence segments Claude sees, burned-in captions,
+attached word timings) branches from, so filtering here once prevents a
+literal `<laugh>` from ever showing up as an on-screen caption or as a "word"
+a reel could end on.
+
 ---
 
 ## 2. Transcript cleanup (`src/transcript_cleanup.py`)
@@ -156,19 +165,25 @@ All {{NUM_REELS}} reels together must still cover DIFFERENT parts of the documen
 at the `analyze_with_claude(...)` / `select_reels(...)` call site you're
 checking — it's not an env var, it's passed explicitly per call.
 
-### 4b. Length rule (`_length_rule()`, lines 184–203)
+### 4b. Length rule (`_length_rule()`)
 
 Built dynamically from `reel_min_seconds()` / `reel_max_seconds()` (from
-`cutter.py`, env-overridable — see §8) and `REEL_END_TOLERANCE_SECONDS = 10.0`.
-With defaults (30s/90s), it renders as:
+`cutter.py`, env-overridable — see §9) and `REEL_END_TOLERANCE_SECONDS = 20.0`
+(widened from 10.0 this session — see §5's table). With defaults (30s/90s),
+it renders as:
 
 ```
-LENGTH: target 30-90 seconds, and use the FULL range when the story is rich — do not crowd everything into short 30-60s clips. A COMPLETE, satisfying ending and full opening context ALWAYS beat hitting the window: if (and only if) the story demands it, you may run up to ~10s under 30s or up to ~10s over 90s so the thought lands and nothing feels cut off. Never end a thought early just to stay under 90s, and never pad with filler to reach 30s. When in doubt, INCLUDE the sentence that finishes the thought rather than cutting on a rising or unfinished line.
+LENGTH: an abrupt ending, or a story that's still building with no resolution, is a FAILED reel, full stop — no score is high enough to excuse it. Completing the thought matters more than hitting a number. 30-90s is where most reels should land, but 10-110s is EQUALLY NORMAL, ordinary range — not a rare exception, not something to reach for only when desperate. Neither 30s nor 90s is a strict requirement — these are illustrations of a principle, not target numbers to hit: a reel that completes its story somewhat under 30s is DONE, full stop — do not extend it just to approach 30s. A reel that genuinely needs somewhat more than 90s to properly resolve is equally fine. Freely use any part of 10-110s whenever the story calls for it. The ONE hard number that matters: 110s is the true ceiling — segments beyond it get mechanically trimmed off the end regardless of what they contain, which can chop off the very resolution you were building toward. So budget for this yourself: if finishing the story properly would run past 110s, that reel's scope is too broad — start it later, narrower, or on a smaller beat that actually resolves within 110s, rather than picking a big arc and letting the cutter truncate its ending for you. A COMPLETE ending is not just a grammatically finished sentence — the STORY BEAT itself must resolve. If a segment states that something happened, changed, or was decided WITHOUT showing what it actually was, INCLUDE the following segment(s) that reveal it, even if that means landing near 110s. Never end a thought early just to stay under 90s, and never pad with filler to reach 30s. When in doubt, INCLUDE the next sentence that finishes the thought rather than cutting on a rising, unfinished, or merely-grammatically-complete line. Do not pick a single short segment expecting it to be stretched to 30s afterward — reaching 30s+ must come from real, connected content you selected (blend multiple segments if one alone isn't enough), never from padding tacked on to hit a number.
 ```
 
-The philosophy stated explicitly in code comments: **completeness beats
-hitting the target window** — a reel is allowed to run outside 30–90s if
-that's what a clean hook/landing requires.
+The philosophy: **completeness beats hitting the target window, in both
+directions.** A 110s "ceiling" is stated as a literal, real number (it's a
+hard mechanical limit the cutter enforces — see §5), but the 30s/90s targets
+themselves are explicitly framed as illustrations of a principle, not
+numbers to hit. (Earlier drafts of this rule used concrete example numbers
+like "26s"/"95-100s" to illustrate the idea — that read as over-specific and
+was replaced with relative wording, since the point is the principle, not
+any particular number.)
 
 ### 4c. Full analyzer prompt (`ANALYZER_PROMPT`, lines 98–165)
 
@@ -184,6 +199,9 @@ You SELECT WHOLE SEGMENTS BY ID, in playback order. You never invent timestamps 
 ISTV is an interview-documentary company. This subject is a PAYING CLIENT — a founder, entrepreneur, lawyer, doctor, woman entrepreneur, veteran-turned-CEO, or similar professional — and THEY will post these reels to THEIR OWN social accounts. The reels are this person's personal brand, not generic clips. Two consequences:
 - Every reel must be something the subject would be PROUD to attach their name to and share: it should make them look credible, human, and worth following.
 - Across the set, a viewer should come away understanding both WHO this person is (their story, values) AND WHAT they do (their company, work, or field). Aim for at least a few reels that touch on their business or work — drawn only from what they actually said, never invented.
+
+# Brand / promotional reels (required, every run)
+Reserve exactly 1-2 of the {{NUM_REELS}} reels as BRAND/PROMOTIONAL reels — content the client can keep and post specifically to promote their business, not just their personal story. Build these from segments where the subject talks about their company, product, service, offer, clients, or mission: what they do, who they help, what makes them different, results they've delivered. They should still open with a real hook and land cleanly like every other reel — the difference is WHAT they're about, not a lower bar. Mark these by setting "is_brand_reel": true in the JSON (every other reel: false). If the transcript genuinely contains little-to-no direct talk about the business/work, pick the 1-2 reels that come closest and still mark them true — never invent business details that were never said.
 
 # THE #1 RULE — cover the WHOLE documentary
 Do NOT take the best 2-3 minute segment and split it into 10 clips. Analyze the ENTIRE documentary and build {{NUM_REELS}} reels from DIFFERENT parts of it across the full runtime. Never rely on a single section or on where the energy spikes.
@@ -202,7 +220,9 @@ Vulnerability is NOT disqualifying — a struggle, a low point, a moment they al
 - A reel = an ordered list of segment ids forming a complete little arc (hook -> point -> payoff).
 - CONTEXT COMPLETE: a cold viewer must understand who is speaking, what happened, and why it matters. Include bridging setup segments — never stitch a payoff to a hook while skipping the sentences in between. If you skip segment ids, the reel will feel random. No pronoun or reference inside the reel may point to a person/thing that only appears in a skipped or un-included sentence.
 - OPEN ON A SELF-CONTAINED HOOK: the first segment must stop a thumb — a bold claim, question, number, or stake — AND must NOT depend on an earlier, un-included sentence. Never open on an unresolved reference: a bare pronoun ("She did it...", "They told me...", "He left...", "It changed everything..."), a demonstrative ("This was the moment...", "That's when..."), or a connector ("And so...", "But then...", "Because of that..."). The subject must be introduced by name, role, or clear noun WITHIN the reel. If the hook references something set up earlier, INCLUDE that setup segment so the context is resolved inside the reel. Never open on filler/continuation ("for a very long time I mean...", "After like three maybe..."). If a later line is a stronger opener, lead with it (cold-open) and set "order_mode":"hook_pull" — it must still be understandable with zero prior context.
-- END ON A LANDED BEAT: the last segment MUST end on a FULLY finished thought the speaker has delivered — the viewer should feel the idea is complete and nothing is left hanging, NOT that the speaker was about to say more. Never end mid-phrase, while the voice is still rising, on a connective ("and/but/so/that/or"), or on dangling setup ("I felt", "she was", "into my", "a lot of that", "to scope it"). If the thought finishes in the following segment (even one trailing word like "career" after "into my"), INCLUDE that segment so the reel resolves — it is far better to run a few seconds long than to cut a beat early. The reel must END on closure, not a hard cut that sounds like the sentence kept going.
+- END ON A LANDED BEAT (this outranks every other rule, including length): the last segment MUST end on a FULLY finished thought the speaker has delivered — the viewer should feel the idea is complete and nothing is left hanging, NOT that the speaker was about to say more. Never end mid-phrase, while the voice is still rising, on a connective ("and/but/so/that/or"), or on dangling setup ("I felt", "she was", "into my", "a lot of that", "to scope it"). If the thought finishes in the following segment (even one trailing word like "career" after "into my"), INCLUDE that segment so the reel resolves — it is far better to run well past the target length than to cut a beat early. When you're unsure whether a candidate ending is complete, resolve the doubt by extending, not by cutting. The reel must END on closure, not a hard cut that sounds like the sentence kept going — an abrupt ending makes the whole reel unusable no matter how strong the rest of it is.
+  GRAMMATICALLY COMPLETE IS NOT THE SAME AS STORY COMPLETE: a sentence can be a full, correctly-punctuated sentence and still leave the STORY unresolved. If the last segment says something happened, changed, was decided, or was realized — WITHOUT actually revealing what it was — that is still building, not landed, even though the sentence itself is grammatically finished (e.g. "and that's the moment everything changed" tells the viewer a change happened but not what it was; "so I made a decision right then" names a decision but not what it was). Keep including segments until the actual content of that outcome is on-screen, not just the announcement that an outcome occurred.
+  MULTI-SPEAKER ENDINGS: if a different speaker's line falls at or near the end of the reel (a reaction, interjection, laugh, or half-sentence cutting in on the previous speaker), that is NOT a landed beat by default. Either (a) that speaker's contribution is itself a real, complete, meaningful line — include enough of it that it resolves on its own, or (b) it isn't — in which case end the reel on the PREVIOUS speaker's last landed line instead and drop the interjection entirely. Never let a reel trail off on someone else's half-reaction just because it happened to come next chronologically.
 - BLEND if it helps: you may stitch up to ~5 non-contiguous segments into one reel if they genuinely connect and flow when spoken aloud.
 - {{LENGTH_RULE}}
 - NO FILLER at the edges ("um/uh/you know/and and").
@@ -237,7 +257,7 @@ Return exactly ONE handle (e.g. "istv-legacymakers"). Use istv-operationceo ONLY
   "reels": [
     {
       "rank": 1, "score": 0, "score_breakdown": {"hook":0,"flow":0,"value":0},
-      "content_type": "", "series_part": null,
+      "content_type": "", "series_part": null, "is_brand_reel": false,
       "order_mode": "chronological",
       "segment_ids": [0,1],
       "first_segment_id": 0, "last_segment_id": 1,
@@ -308,14 +328,60 @@ the actual `start_time_seconds`/`end_time_seconds` pairs baked into the
 | Constant | Value | Purpose |
 |---|---|---|
 | `MIN_REEL_SECONDS` / `MAX_REEL_SECONDS` | 15.0 / 60.0 (defaults; `generate_reels.py` overrides to 30/90 via env) | soft target floor/ceiling |
-| `REEL_END_TOLERANCE_SECONDS` | 10.0 | how far a reel may run past the ceiling to land cleanly |
+| `REEL_END_TOLERANCE_SECONDS` | 20.0 (widened from 10.0) | how far a reel may run past the ceiling — or under the floor — to land cleanly; this is also the real mechanical ceiling (`max_dur + flex`, e.g. 110s) enforced by `_cap_segment_ids` |
 | `LEAD_PAD_SECONDS` / `TAIL_PAD_SECONDS` | 0.10 / 0.45 | padding added before first word / after last word of a cut |
 | `NATURAL_TAIL_PAUSE` | 0.28 | breath room after speech ends |
-| `CONTINUATION_GAP_SEC` | 0.42 | max gap to pull in a trailing word that's really part of the same phrase |
-| `MAX_WORD_CONTINUATION` | 6 | cap on how many extra words can be pulled in this way |
+| `CONTINUATION_GAP_SEC` | 0.6 (widened from 0.42) | max gap to pull in a trailing word that's really part of the same phrase |
+| `MAX_WORD_CONTINUATION` | 10 (widened from 6) | cap on how many extra words can be pulled in this way |
 | `MAX_REEL_SPANS` | 5 | max number of non-contiguous stitched clips per reel |
 | `MAX_CONTEXT_BRIDGE_SEGMENTS` | 4 | max skipped segments auto-inserted to bridge a gap |
 | `MAX_CONTEXT_HEAD_PREPENDS` | 2 | max setup sentences auto-prepended before a dependent opener |
+
+**Floor-side mechanical padding** (`src/analyzer.py`'s `_maybe_extend_playback_rows`,
+called from `_normalize_cut_sheets`): if a reel resolves to a single segment
+shorter than `min_dur - REEL_END_TOLERANCE_SECONDS` (e.g. 30-20=10s — NOT
+just under `min_dur` itself, so a genuinely complete ~26s reel is left alone),
+it gets extended up toward `min_dur` by pulling in whole subsequent SENTENCE
+segments (`utterance_segments` — the same units Claude picks from), never by
+adding raw seconds. Raw-second padding used to land mid-word/mid-phrase with
+zero regard for where a sentence actually ends; walking forward through whole
+sentence segments guarantees any extension lands on a real sentence boundary.
+
+**Speaker-aware extension/bridging.** `_extend_resolved_tail_ids` (tail
+extension, used to "resolve" a dangling ending) and `_fill_context_bridges`
+(splicing in skipped segments between two non-adjacent picks) both check
+speaker identity before adding a segment — `_extend_resolved_tail_ids` won't
+cross into a different speaker's segment even if it looks like it would
+"resolve" the dangling text, and `_fill_context_bridges` won't bridge a gap
+if any segment in it (or on either side) belongs to a different speaker
+(`_same_speaker_chain()`). Before this, both functions worked on pure
+chronological adjacency — the actual mechanism behind reels ending on a
+different speaker's reaction/interjection cutting in, independent of
+anything the prompt said, since this runs as mechanical post-processing on
+Claude's already-returned segment ids.
+
+**The final trim step is the highest-leverage one to get right.**
+`_trim_dangling_tail_ids` runs unconditionally as the very last step of
+`build_reel_cut_sheet()` on every reel — it pops the last segment off if
+`_segment_text_dangles()` flags it, with no way for the prompt to prevent a
+false positive. `DANGLING_END_WORDS` used to be drastically over-broad
+(bare pronouns like `it`/`me`/`this`/`that`, quantifiers like `all`/`really`/
+`just`/`so`) — all extremely common as the literal last word of a genuinely
+complete, often emphatic sentence ("that's me.", "that's all.", "I made it
+happen."). Any reel whose correct ending happened to land on one of these
+ordinary words got it silently discarded, regardless of how well Claude
+picked the segment. Narrowed to near-universal incompleteness signals only
+(prepositions needing an object, articles, connectors, auxiliaries, modals,
+possessive determiners, genuine filler words). `INCOMPLETE_END_WORDS` (the
+gerund list — "building", "living", "growing") removed from this specific
+check too, since a gerund ending a sentence isn't a reliable incompleteness
+signal (still used for its other, lower-risk word-padding purposes).
+`DANGLING_END_PHRASES` had several transcript-specific memorized snippets
+removed (verbatim phrases from one past interview, not general patterns).
+One known remaining edge case: "that is exactly who i am" still false-positives,
+since the phrase check for "i am" doesn't special-case the "who/what X am"
+completing construction — rarer than the bare-pronoun case, left as a known
+limitation rather than a fully-solved problem.
 
 `build_reel_cut_sheet()` runs, per reel, roughly in this order:
 1. Extract segment ids from Claude's output; dedupe near-repeats (v2 only).
@@ -429,9 +495,14 @@ code change (not just an env var) to expose it.
 | Symptom | Look at |
 |---|---|
 | Reel opens on a confusing pronoun/fragment | `ANALYZER_PROMPT`'s "OPEN ON A SELF-CONTAINED HOOK" rule, then `CONTEXT_OPENER_WORDS`/`SELF_CONTAINED_OPENERS` in `cutter.py` |
-| Reel ends mid-sentence | "END ON A LANDED BEAT" rule, then `DANGLING_END_WORDS`/`DANGLING_END_PHRASES`/`STRONG_END_WORDS` in `cutter.py` |
+| Reel ends mid-sentence, or a fine ending got chopped anyway | Check `_trim_dangling_tail_ids`/`_segment_text_dangles` in `cutter.py` FIRST — it runs unconditionally on every reel and can override a correct Claude ending via a word-list false positive; only look at the "END ON A LANDED BEAT" prompt rule after ruling that out |
 | Reel too short/long vs. expectation | `_length_rule()` output + `REEL_MIN_SECONDS`/`REEL_MAX_SECONDS`/`REEL_END_TOLERANCE_SECONDS` |
 | Wrong/missing series structure | confirm `story_mode` at the actual call site — desktop backend always passes `False` |
 | Speaker name misspelled in captions | `REEL_SPEAKER_NAME`/`REEL_NAME_ALIASES`, `detect_name_aliases()`, `correct_speaker_name()` |
 | A clearly-wrong ASR word slipped through | `_CLEAN_SYSTEM` prompt scope (only fixes "clearly misheard" words, on purpose leaves ambiguous ones) |
 | Claude picked a duplicate/repetitive segment | only guarded against under V2 profile ("ZERO REPETITION" rule + `_dedupe_repeated_segments`) |
+| Reel ends on a grammatically-complete but narratively-unresolved line | "GRAMMATICALLY COMPLETE IS NOT THE SAME AS STORY COMPLETE" bullet |
+| Reel ends on someone else's reaction/interjection | "MULTI-SPEAKER ENDINGS" bullet (prompt) AND `_extend_resolved_tail_ids`/`_fill_context_bridges` speaker checks in `cutter.py` (mechanics) — if this recurs after checking both, the mechanism-level fix is the one to re-verify, since it overrides prompt intent regardless of what Claude picked |
+| A reel runs past 90s (or under 30s) | check whether it's within the `REEL_END_TOLERANCE_SECONDS` window (10-110s at defaults) — that's by design; only outside that range, or a truncated/unresolved ending, is a bug |
+| Literal `<laugh>`/`[cough]`-style text in captions | `_is_non_speech_tag()` in `src/transcription.py` — should already be filtered; check if Rev.ai emitted a tag shape the regex doesn't match |
+| No reel is tagged for the client's brand/business | `is_brand_reel` field — check `_normalize_claude_reel` parsed it and the "Brand / promotional reels" prompt block is intact |

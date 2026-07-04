@@ -17,20 +17,29 @@ logger = logging.getLogger(__name__)
 LEAD_PAD_SECONDS = 0.10
 TAIL_PAD_SECONDS = 0.45
 NATURAL_TAIL_PAUSE = 0.28
-CONTINUATION_GAP_SEC = 0.42
+# Gap allowed when pulling a trailing word/phrase into the reel because it
+# completes the last selected segment's thought (e.g. "into my" -> "career").
+# Widened from 0.42s so a slightly slower-spoken landing phrase still gets
+# pulled in instead of leaving the reel hanging on a dangling word.
+CONTINUATION_GAP_SEC = 0.6
 NEXT_WORD_GUARD_SEC = 0.03
 MAX_REEL_SECONDS = 60.0
 MIN_REEL_SECONDS = 15.0
 MAX_REEL_SPANS = 5
 MAX_CONTEXT_BRIDGE_SEGMENTS = 4
-MAX_WORD_CONTINUATION = 6
+# Max extra words the tail can pull in to finish a dangling thought. Widened
+# from 6 so a longer trailing clause ("...and that changed everything for my
+# whole family") can still be captured instead of getting cut short partway.
+MAX_WORD_CONTINUATION = 10
 MAX_CONTEXT_HEAD_PREPENDS = 2
 
 # Extra seconds the cutter may exceed (or fall under) the target window so reels
 # land on a COMPLETE thought / open with full context instead of a hard
 # mid-sentence cut. This is a soft ceiling used only when the story demands it
 # (extending a dangling ending or prepending setup) — never a target length.
-REEL_END_TOLERANCE_SECONDS = 10.0
+# Widened from 10s: abrupt/incomplete endings matter far more than staying
+# inside the window, so the cutter needs real room to let a thought land.
+REEL_END_TOLERANCE_SECONDS = 20.0
 
 
 def reel_max_seconds() -> float:
@@ -74,9 +83,14 @@ V2_EXTRA_OPENER_WORDS = frozenset({
 
 # v2-only: extra dangling end tokens (contractions / filler tails missed by v1).
 V2_EXTRA_DANGLING_WORDS = frozenset({
+    # Contractions — a sentence essentially never naturally ends on a bare
+    # contraction like this without continuation, so these are a reliable signal.
     "whos", "thats", "theres", "heres", "wheres", "im", "ive", "id", "ill",
     "youre", "youve", "well", "weve", "theyre", "theyve", "hes", "shes", "its",
-    "gonna", "wanna", "kinda", "sorta", "say", "mean", "guess", "think",
+    "gonna", "wanna", "kinda", "sorta",
+    # Removed: "say"/"mean"/"guess"/"think" — these are ordinary verbs that
+    # frequently end complete sentences ("that's what I think.", "that's my
+    # best guess."), not reliable incompleteness signals as bare last words.
 })
 
 V2_EXTRA_DANGLING_PHRASES = (
@@ -109,40 +123,49 @@ SELF_CONTAINED_OPENERS = frozenset({
     "everybody", "nobody", "people", "most", "many",
 })
 
+
+# Words that essentially NEVER grammatically end a complete, standalone
+# English sentence in natural speech — prepositions/articles that require a
+# following object, and connectors/subordinators that introduce a clause.
+# Deliberately does NOT include bare pronouns ("it", "me", "that", "this"),
+# quantifiers/intensifiers ("all", "really", "just", "so"), or demonstratives —
+# those are extremely common as the literal last word of a genuinely complete,
+# often emphatic sentence ("that's me.", "that's all.", "I made it happen.",
+# "I believe in this."). Treating them as automatic incompleteness signals
+# was silently discarding Claude's correct endings on any reel that happened
+# to land on one of these ordinary words — a false-positive rate high enough
+# to produce "sudden ending" complaints regardless of how well Claude picked
+# the segment, since this check runs unconditionally as the last step.
 DANGLING_END_WORDS = frozenset({
-    "and", "or", "but", "so", "to", "the", "a", "an", "of", "in", "on", "at",
-    "with", "for", "that", "which", "who", "when", "where", "as", "if", "because",
-    "yeah", "um", "uh", "like", "you", "know",
-    "my", "your", "their", "our", "his", "her", "its", "this", "that", "these", "those",
-    "into", "from", "about", "through", "during", "before", "after", "between",
+    "and", "but", "because", "while", "as", "if", "which", "who", "when", "where",
+    "to", "of", "in", "on", "at", "with", "for", "into", "from", "about",
+    "through", "during", "before", "after", "between",
+    "a", "an", "the",
     "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "not",
     "will", "would", "could", "should", "can", "may", "might", "must",
-    "do", "does", "did", "not", "just", "very", "really", "also", "then", "while",
-    "even", "still", "more", "some", "any", "every", "each", "both", "all", "only",
-    "stuck", "focused",
-    "i", "me", "we", "they", "them", "he", "she", "it", "or",
+    "my", "your", "their", "our", "his", "her", "its",
+    "yeah", "um", "uh", "like", "know",
 })
 
+# Phrase-level checks require more surrounding context than a single word, so
+# these can afford to be slightly broader — but must still be GENERAL patterns,
+# not memorized snippets from one specific past transcript (several of the
+# previous entries here — "our mission is easy", "those barriers", "i knew
+# this app", "the doctors are signing notes saying" — were exactly that: a
+# verbatim phrase from one prior interview that happened to get hardcoded in,
+# which does nothing useful for any other transcript and was pure noise/risk).
 DANGLING_END_PHRASES = (
     "i think that",
     "a lot of that",
-    "and i think that",
-    "so i take a lot of that",
-    "she was definitely",
     "but yeah",
     "i felt",
     "i feel",
     "i was",
     "i am",
-    "our mission is easy",
-    "those barriers",
-    "i knew this app",
-    "the doctors are signing notes saying",
     "into my",
     "years into my",
     "in the middle of my",
-    "too focused in the past or stuck",
-    "trying to grieve",
 )
 
 # Words that can end a reel even without terminal punctuation.
@@ -252,12 +275,30 @@ def _next_segment_after(tail_id: int, seg_by_id: dict[int, dict]) -> int | None:
     return None
 
 
+def _same_speaker_chain(
+    prev_id: int, gap_ids: list[int], next_id: int, seg_by_id: dict[int, dict]
+) -> bool:
+    """True only if prev, every gap segment, and next all share one speaker."""
+    ids_to_check = [prev_id, *gap_ids, next_id]
+    speakers = {seg_by_id[i].get("speaker") for i in ids_to_check if i in seg_by_id}
+    return len(speakers) <= 1
+
+
 def _fill_context_bridges(
     segment_ids: list[int],
     seg_by_id: dict[int, dict],
     max_len: float,
 ) -> list[int]:
-    """Insert short skipped segments between picks so stitched reels keep viewer context."""
+    """Insert short skipped segments between picks so stitched reels keep viewer context.
+
+    Only bridges a gap where every segment involved (both picks, and
+    everything between them) shares one speaker. Without this check, this
+    would silently splice a different speaker's aside/question/reaction into
+    the middle of a reel purely because it happened to sit between two of
+    Claude's picks chronologically — reading as a random interruption rather
+    than intentional context. If the gap spans a speaker change, it's left
+    unfilled (the reel just stitches straight to the next pick instead).
+    """
     if len(segment_ids) < 2:
         return list(segment_ids)
 
@@ -270,7 +311,8 @@ def _fill_context_bridges(
                 filled.append(sid)
             continue
         gap_ids = [g for g in range(prev + 1, sid) if g in seg_by_id]
-        if gap_ids and len(gap_ids) <= MAX_CONTEXT_BRIDGE_SEGMENTS:
+        same_speaker = _same_speaker_chain(prev, gap_ids, sid, seg_by_id)
+        if gap_ids and same_speaker and len(gap_ids) <= MAX_CONTEXT_BRIDGE_SEGMENTS:
             trial = filled + gap_ids + [sid]
             if _ids_total_duration(trial, seg_by_id) <= max_len + 0.01:
                 filled.extend(gap_ids)
@@ -372,7 +414,19 @@ def _extend_resolved_tail_ids(
     seg_by_id: dict[int, dict],
     max_len: float,
 ) -> list[int]:
-    """Append the next sentence segment(s) when the reel ends on an incomplete thought."""
+    """Append the next sentence segment(s) when the reel ends on an incomplete thought.
+
+    Only extends into the next segment if it's the SAME speaker. Without this
+    check, a generic word-list "this sounds dangling" match would happily pull
+    in whatever comes next chronologically — even a different speaker's
+    reaction, interjection, or half-sentence — and treat it as if it resolved
+    the first speaker's thought. That produced reels ending on someone else's
+    voice cutting in, which a viewer reads as a random, unintentional cut, not
+    a landed beat. If the actual next line is a different speaker, this
+    correctly stops rather than mechanically stitching them together — see
+    the "MULTI-SPEAKER ENDINGS" rule in ANALYZER_PROMPT for the corresponding
+    guidance on Claude's side of this same problem.
+    """
     ids = list(segment_ids)
     if not ids:
         return ids
@@ -395,6 +449,8 @@ def _extend_resolved_tail_ids(
             break
         next_seg = seg_by_id.get(next_id)
         if not next_seg or _is_weak_continuation_segment(next_seg):
+            break
+        if next_seg.get("speaker") != last_seg.get("speaker"):
             break
         trial = ids + [next_id]
         if _ids_total_duration(trial, seg_by_id) > max_len + 0.01:
@@ -828,7 +884,14 @@ def _segment_text_dangles(text: str) -> bool:
     last = tokens[-1]
     if last in STRONG_END_WORDS:
         return False
-    if last in DANGLING_END_WORDS or last in INCOMPLETE_END_WORDS:
+    # Note: deliberately NOT checking INCOMPLETE_END_WORDS (the -ing list) here.
+    # A gerund/participle is not a reliable incompleteness signal — plenty of
+    # complete, powerful sentences end on one ("she never stopped fighting.",
+    # "I finally started living.", "what he loved most was building."). It's
+    # still used elsewhere (word-level tail-padding decisions), where being
+    # wrong just means one extra trailing word considered, not an entire
+    # selected segment getting discarded.
+    if last in DANGLING_END_WORDS:
         return True
     lower = cleaned.lower()
     if any(lower.endswith(phrase) for phrase in DANGLING_END_PHRASES):

@@ -1,7 +1,21 @@
+import re
 import time
 from rev_ai import apiclient
 
 from src.cutter import normalize_word_timings
+
+# Rev.ai emits non-speech events (laughter, coughing, crosstalk, etc.) as
+# "text" elements wrapped in angle/square brackets, e.g. "<laugh>", "[cough]".
+# Real spoken words never look like that, so anything fully bracketed this way
+# gets dropped here — at the single point ALL downstream consumers (sentence
+# segments shown to Claude, burned-in captions, word-attachment) branch from —
+# rather than leaking through as a literal on-screen caption or a fake "word"
+# Claude could end a reel on.
+_NON_SPEECH_TAG_RE = re.compile(r"^[<\[].*[>\]]$")
+
+
+def _is_non_speech_tag(value: str) -> bool:
+    return bool(_NON_SPEECH_TAG_RE.match(str(value or "").strip()))
 
 
 def transcribe_audio(
@@ -83,6 +97,8 @@ def _parse(raw: dict) -> dict:
         speaker = mono.get("speaker", 0)
         for el in mono.get("elements", []):
             if el.get("type") == "text":
+                if _is_non_speech_tag(el["value"]):
+                    continue
                 words.append(
                     {
                         "index": word_index,

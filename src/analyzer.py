@@ -28,8 +28,8 @@ CLAUDE_MODELS = {
 
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
 
-VALID_NUM_REELS = {3, 5, 10, 12}
-DEFAULT_NUM_REELS = 10
+VALID_NUM_REELS = {3, 5, 10, 12, 15}
+DEFAULT_NUM_REELS = 15
 MIN_REEL_DURATION = 15.0
 MAX_REEL_DURATION = MAX_REEL_SECONDS
 
@@ -125,6 +125,9 @@ ISTV is an interview-documentary company. This subject is a PAYING CLIENT — a 
 - Every reel must be something the subject would be PROUD to attach their name to and share: it should make them look credible, human, and worth following.
 - Across the set, a viewer should come away understanding both WHO this person is (their story, values) AND WHAT they do (their company, work, or field). Aim for at least a few reels that touch on their business or work — drawn only from what they actually said, never invented.
 
+# Brand / promotional reels (required, every run)
+Reserve exactly 1-2 of the {{NUM_REELS}} reels as BRAND/PROMOTIONAL reels — content the client can keep and post specifically to promote their business, not just their personal story. Build these from segments where the subject talks about their company, product, service, offer, clients, or mission: what they do, who they help, what makes them different, results they've delivered. They should still open with a real hook and land cleanly like every other reel — the difference is WHAT they're about, not a lower bar. Mark these by setting "is_brand_reel": true in the JSON (every other reel: false). If the transcript genuinely contains little-to-no direct talk about the business/work, pick the 1-2 reels that come closest and still mark them true — never invent business details that were never said.
+
 # THE #1 RULE — cover the WHOLE documentary
 Do NOT take the best 2-3 minute segment and split it into 10 clips. Analyze the ENTIRE documentary and build {{NUM_REELS}} reels from DIFFERENT parts of it across the full runtime. Never rely on a single section or on where the energy spikes.
 
@@ -142,7 +145,9 @@ Vulnerability is NOT disqualifying — a struggle, a low point, a moment they al
 - A reel = an ordered list of segment ids forming a complete little arc (hook -> point -> payoff).
 - CONTEXT COMPLETE: a cold viewer must understand who is speaking, what happened, and why it matters. Include bridging setup segments — never stitch a payoff to a hook while skipping the sentences in between. If you skip segment ids, the reel will feel random. No pronoun or reference inside the reel may point to a person/thing that only appears in a skipped or un-included sentence.
 - OPEN ON A SELF-CONTAINED HOOK: the first segment must stop a thumb — a bold claim, question, number, or stake — AND must NOT depend on an earlier, un-included sentence. Never open on an unresolved reference: a bare pronoun ("She did it...", "They told me...", "He left...", "It changed everything..."), a demonstrative ("This was the moment...", "That's when..."), or a connector ("And so...", "But then...", "Because of that..."). The subject must be introduced by name, role, or clear noun WITHIN the reel. If the hook references something set up earlier, INCLUDE that setup segment so the context is resolved inside the reel. Never open on filler/continuation ("for a very long time I mean...", "After like three maybe..."). If a later line is a stronger opener, lead with it (cold-open) and set "order_mode":"hook_pull" — it must still be understandable with zero prior context.
-- END ON A LANDED BEAT: the last segment MUST end on a FULLY finished thought the speaker has delivered — the viewer should feel the idea is complete and nothing is left hanging, NOT that the speaker was about to say more. Never end mid-phrase, while the voice is still rising, on a connective ("and/but/so/that/or"), or on dangling setup ("I felt", "she was", "into my", "a lot of that", "to scope it"). If the thought finishes in the following segment (even one trailing word like "career" after "into my"), INCLUDE that segment so the reel resolves — it is far better to run a few seconds long than to cut a beat early. The reel must END on closure, not a hard cut that sounds like the sentence kept going.
+- END ON A LANDED BEAT (this outranks every other rule, including length): the last segment MUST end on a FULLY finished thought the speaker has delivered — the viewer should feel the idea is complete and nothing is left hanging, NOT that the speaker was about to say more. Never end mid-phrase, while the voice is still rising, on a connective ("and/but/so/that/or"), or on dangling setup ("I felt", "she was", "into my", "a lot of that", "to scope it"). If the thought finishes in the following segment (even one trailing word like "career" after "into my"), INCLUDE that segment so the reel resolves — it is far better to run well past the target length than to cut a beat early. When you're unsure whether a candidate ending is complete, resolve the doubt by extending, not by cutting. The reel must END on closure, not a hard cut that sounds like the sentence kept going — an abrupt ending makes the whole reel unusable no matter how strong the rest of it is.
+  GRAMMATICALLY COMPLETE IS NOT THE SAME AS STORY COMPLETE: a sentence can be a full, correctly-punctuated sentence and still leave the STORY unresolved. If the last segment says something happened, changed, was decided, or was realized — WITHOUT actually revealing what it was — that is still building, not landed, even though the sentence itself is grammatically finished (e.g. "and that's the moment everything changed" tells the viewer a change happened but not what it was; "so I made a decision right then" names a decision but not what it was). Keep including segments until the actual content of that outcome is on-screen, not just the announcement that an outcome occurred.
+  MULTI-SPEAKER ENDINGS: if a different speaker's line falls at or near the end of the reel (a reaction, interjection, laugh, or half-sentence cutting in on the previous speaker), that is NOT a landed beat by default. Either (a) that speaker's contribution is itself a real, complete, meaningful line — include enough of it that it resolves on its own, or (b) it isn't — in which case end the reel on the PREVIOUS speaker's last landed line instead and drop the interjection entirely. Never let a reel trail off on someone else's half-reaction just because it happened to come next chronologically.
 - BLEND if it helps: you may stitch up to ~5 non-contiguous segments into one reel if they genuinely connect and flow when spoken aloud.
 - {{LENGTH_RULE}}
 - NO FILLER at the edges ("um/uh/you know/and and").
@@ -177,7 +182,7 @@ Return exactly ONE handle (e.g. "istv-legacymakers"). Use istv-operationceo ONLY
   "reels": [
     {
       "rank": 1, "score": 0, "score_breakdown": {"hook":0,"flow":0,"value":0},
-      "content_type": "", "series_part": null,
+      "content_type": "", "series_part": null, "is_brand_reel": false,
       "order_mode": "chronological",
       "segment_ids": [0,1],
       "first_segment_id": 0, "last_segment_id": 1,
@@ -212,21 +217,45 @@ def _length_rule() -> str:
     """Build the LENGTH guidance line from the active duration window (env-configurable).
 
     Completeness-first: a finished thought + full context always beats hitting the
-    window. The story may justify running a little under the floor or a little over
-    the ceiling — but only when those extra seconds buy a complete ending or the
-    setup a cold viewer needs.
+    window. {lo}-{hi}s is where most reels should land, but the full {lo-flex}-{hi+flex}s
+    range is presented as EQUALLY NORMAL (not a rare exception) — because the cutter
+    (src/cutter.py) enforces {hi+flex}s as a hard mechanical ceiling: if Claude picks
+    segment ids that run past it, the cutter trims from the end to fit, which can lop
+    the resolving/payoff segment right back off regardless of how good the selection
+    was. So Claude needs to self-limit to that real ceiling, not just be told "the
+    window is flexible" in the abstract — otherwise the truncation happens anyway,
+    just mechanically instead of by prompt.
     """
     lo = int(round(reel_min_seconds()))
     hi = int(round(reel_max_seconds()))
     flex = int(round(REEL_END_TOLERANCE_SECONDS))
+    ceiling = hi + flex
+    floor = max(1, lo - flex)
     return (
-        f"LENGTH: target {lo}-{hi} seconds, and use the FULL range when the story is rich — "
-        f"do not crowd everything into short {lo}-{int((lo + hi) / 2)}s clips. "
-        f"A COMPLETE, satisfying ending and full opening context ALWAYS beat hitting the window: "
-        f"if (and only if) the story demands it, you may run up to ~{flex}s under {lo}s "
-        f"or up to ~{flex}s over {hi}s so the thought lands and nothing feels cut off. "
-        f"Never end a thought early just to stay under {hi}s, and never pad with filler to reach {lo}s. "
-        f"When in doubt, INCLUDE the sentence that finishes the thought rather than cutting on a rising or unfinished line."
+        f"LENGTH: an abrupt ending, or a story that's still building with no resolution, is a "
+        f"FAILED reel, full stop — no score is high enough to excuse it. Completing the thought "
+        f"matters more than hitting a number. {lo}-{hi}s is where most reels should land, but "
+        f"{floor}-{ceiling}s is EQUALLY NORMAL, ordinary range — not a rare exception, not something "
+        f"to reach for only when desperate. Neither {lo}s nor {hi}s is a strict requirement — these are "
+        f"illustrations of a principle, not target numbers to hit: a reel that completes its story "
+        f"somewhat under {lo}s is DONE, full stop — do not extend it just to approach {lo}s. A reel that "
+        f"genuinely needs somewhat more than {hi}s to properly resolve is equally fine. Freely use any "
+        f"part of {floor}-{ceiling}s whenever the story calls for it. "
+        f"The ONE hard number that matters: {ceiling}s is the true ceiling — segments beyond it get "
+        f"mechanically trimmed off the end regardless of what they contain, which can chop off the "
+        f"very resolution you were building toward. So budget for this yourself: if finishing the "
+        f"story properly would run past {ceiling}s, that reel's scope is too broad — start it later, "
+        f"narrower, or on a smaller beat that actually resolves within {ceiling}s, rather than picking "
+        f"a big arc and letting the cutter truncate its ending for you. "
+        f"A COMPLETE ending is not just a grammatically finished sentence — the STORY BEAT itself must "
+        f"resolve. If a segment states that something happened, changed, or was decided WITHOUT showing "
+        f"what it actually was, INCLUDE the following segment(s) that reveal it, even if that means "
+        f"landing near {ceiling}s. Never end a thought early just to stay under {hi}s, and never pad "
+        f"with filler to reach {lo}s. When in doubt, INCLUDE the next sentence that finishes the thought "
+        f"rather than cutting on a rising, unfinished, or merely-grammatically-complete line. "
+        f"Do not pick a single short segment expecting it to be stretched to {lo}s afterward — reaching "
+        f"{lo}s+ must come from real, connected content you selected (blend multiple segments if one alone "
+        f"isn't enough), never from padding tacked on to hit a number."
     )
 
 
@@ -407,6 +436,7 @@ def _normalize_claude_reel(raw: dict, fallback_rank: int) -> dict:
             series_part = int(series_part)
         except (TypeError, ValueError):
             series_part = None
+    is_brand_reel = bool(raw.get("is_brand_reel"))
     excerpt = str(raw.get("transcript_excerpt") or "").strip()
     nested = raw.get("segments") or []
     segment_ids = raw.get("segment_ids") or []
@@ -462,6 +492,7 @@ def _normalize_claude_reel(raw: dict, fallback_rank: int) -> dict:
         "best_posting_time": best_posting_time,
         "content_type": content_type,
         "series_part": series_part,
+        "is_brand_reel": is_brand_reel,
         "hashtags": hashtags,
         "theme": why,
         "hook_type": _score_hook_type(score_breakdown),
@@ -711,16 +742,50 @@ def _cap_playback_rows(rows: list[dict], max_total: float) -> list[dict]:
 
 
 def _maybe_extend_playback_rows(
-    rows: list[dict], min_total: float, transcript_end: float
+    rows: list[dict],
+    min_total: float,
+    transcript_end: float,
+    utterance_segments: list[dict] | None = None,
 ) -> list[dict]:
+    """Extend a too-short single-segment reel up to the minimum duration.
+
+    Prefers pulling in whole subsequent SENTENCE segments (the same
+    sentence-bounded units Claude picks reels from, via `utterance_segments`)
+    over blindly adding raw seconds. Raw-second padding has no idea where a
+    word or sentence ends, so it could — and did — land mid-word or mid-phrase
+    just to hit the numeric floor, producing an ending that's arbitrary rather
+    than a real completed thought. Sentence segments are already boundary-safe
+    by construction (see build_sentence_segments), so walking forward through
+    them one at a time guarantees the extension never splits a word/sentence.
+    """
     if not rows or transcript_end <= 0:
         return rows
     deficit = min_total - _playback_total_seconds(rows)
     if deficit <= 0.02:
         return rows
     last = rows[-1]
-    a = _float_safe(last.get("start_time_seconds"))
     b = _float_safe(last.get("end_time_seconds"))
+
+    if utterance_segments:
+        candidates = sorted(
+            (s for s in utterance_segments if _float_safe(s.get("start")) >= b - 0.05),
+            key=lambda s: _float_safe(s.get("start")),
+        )
+        new_end = b
+        for seg in candidates:
+            seg_end = _float_safe(seg.get("end"))
+            if seg_end <= new_end + 0.01:
+                continue
+            new_end = min(seg_end, transcript_end)
+            if new_end - b >= deficit - 0.02:
+                break
+        if new_end > b + 0.01:
+            last["end_time_seconds"] = new_end
+            return rows
+        # No sentence segments available to extend into (e.g. this is already
+        # the last segment in the transcript) — fall through to raw-second
+        # padding below rather than leaving the reel under the floor.
+
     room = transcript_end - b
     if room <= 0.02:
         return rows
@@ -790,6 +855,12 @@ def _normalize_cut_sheets(
     max_dur = reel_max_seconds()
     min_dur = reel_min_seconds()
     soft_dur = max_dur + REEL_END_TOLERANCE_SECONDS
+    # Mirror the ceiling's tolerance on the floor side: a reel that already
+    # completes its story a bit under min_dur (e.g. 26s when the target is
+    # 30s) is fine as-is — only pad reels shorter than THIS toward min_dur,
+    # so a genuinely short-but-complete story doesn't get mechanically
+    # stretched just to hit the target number.
+    soft_min = max(1.0, min_dur - REEL_END_TOLERANCE_SECONDS)
 
     for reel in analysis.get("reels", []):
         order_mode = normalize_order_mode(reel.get("order_mode") or reel.get("assembly_mode"))
@@ -853,8 +924,8 @@ def _normalize_cut_sheets(
             reel["hook_line_end_seconds"] = reel["hook_line_start_seconds"] + 5.0
 
         sheet = _cap_playback_rows(sheet, soft_dur)
-        if _playback_total_seconds(sheet) < min_dur and len(sheet) == 1 and tmax > 0:
-            sheet = _maybe_extend_playback_rows(sheet, min_dur, tmax)
+        if _playback_total_seconds(sheet) < soft_min and len(sheet) == 1 and tmax > 0:
+            sheet = _maybe_extend_playback_rows(sheet, min_dur, tmax, utterance_segments)
             sheet = _cap_playback_rows(sheet, soft_dur)
 
         reel["segment_ids"] = extract_reel_segment_ids(reel) or extract_ids_from_sheet(sheet)

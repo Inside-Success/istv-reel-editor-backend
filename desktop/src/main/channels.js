@@ -8,6 +8,7 @@ module.exports = {
   PROXY_PROGRESS: "media:proxy-progress",
   TO_FILE_URL: "media:to-file-url",
   GENERATE_REELS: "pipeline:generate-reels",
+  SELECT_REELS_ONLY: "pipeline:select-reels-only",
   PIPELINE_EVENT: "pipeline:event",
   PICK_AUDIO: "media:pick-audio",
   SAVE_PROJECT: "project:save",
