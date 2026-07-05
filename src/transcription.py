@@ -40,6 +40,48 @@ def transcribe_audio(
     return poll_transcription_job(job_id, api_key, progress_cb)
 
 
+def submit_transcription_job(audio_path: str, api_key: str) -> str:
+    """Submit audio to Rev.ai and return immediately with the Rev.ai job id.
+
+    Split out from `transcribe_audio` for hosts (e.g. serverless functions) that
+    can't block for the minutes a transcription takes — the caller persists the
+    returned id and checks progress later via `check_transcription_job_once`.
+    """
+    client = apiclient.RevAiAPIClient(api_key)
+    job = client.submit_job_local_file(
+        filename=audio_path,
+        language="en",
+        skip_diarization=False,
+        skip_punctuation=False,
+        remove_disfluencies=False,
+        metadata="ISTV Reel Editor",
+    )
+    return job.id
+
+
+def check_transcription_job_once(job_id: str, api_key: str) -> dict:
+    """Check an already-submitted Rev.ai job's status without blocking/looping.
+
+    Returns {"status": "transcribing"} while still running, or
+    {"status": "done", "transcript": {...}} once complete. Raises RuntimeError
+    if the job failed. For hosts that can't hold a process open across the
+    transcription's whole runtime — call this once per external poll instead
+    of `poll_transcription_job`'s blocking loop.
+    """
+    client = apiclient.RevAiAPIClient(api_key)
+    details = client.get_job_details(job_id)
+    status = str(details.status).lower()
+
+    if "failed" in status:
+        failure = getattr(details, "failure", "unknown error")
+        raise RuntimeError(f"Rev.ai transcription failed: {failure}")
+    if "transcribed" not in status:
+        return {"status": "transcribing"}
+
+    raw = client.get_transcript_json(job_id)
+    return {"status": "done", "transcript": _parse(raw)}
+
+
 def poll_transcription_job(job_id: str, api_key: str, progress_cb=None) -> dict:
     """Poll an already-submitted Rev.ai job to completion and return the parsed transcript.
 

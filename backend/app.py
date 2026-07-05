@@ -61,6 +61,13 @@ app.add_middleware(
 _JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 
+# Buffers chunked audio uploads (see /transcribe/init|chunk|finish). Not
+# persisted through job_store since a chunk set is only needed transiently
+# until /finish assembles it — a restart mid-upload just means the client
+# retries, same as any other dropped connection.
+_UPLOADS: dict[str, dict[int, bytes]] = {}
+_UPLOAD_LOCK = threading.Lock()
+
 
 def _set(job_id: str, **fields) -> None:
     with _LOCK:
@@ -227,16 +234,7 @@ def health() -> dict:
     }
 
 
-@app.post("/transcribe")
-async def transcribe(request: Request) -> dict:
-    """Accept a compressed audio file (raw octet-stream) and start a Rev.ai job.
-
-    The filename is passed via the ``X-Filename`` header so we keep the right
-    extension; the body is the raw bytes (no multipart needed → trivial upload
-    progress on the client).
-    """
-    fname = request.headers.get("x-filename", "audio.mp3")
-    body = await request.body()
+def _start_transcription(body: bytes, fname: str) -> dict:
     if not body:
         raise HTTPException(status_code=400, detail="Empty request body")
 
@@ -259,6 +257,55 @@ async def transcribe(request: Request) -> dict:
     )
     threading.Thread(target=_run_transcription, args=(job_id, path), daemon=True).start()
     return {"job_id": job_id, "bytes": len(body)}
+
+
+@app.post("/transcribe")
+async def transcribe(request: Request) -> dict:
+    """Accept a compressed audio file (raw octet-stream) and start a Rev.ai job.
+
+    The filename is passed via the ``X-Filename`` header so we keep the right
+    extension; the body is the raw bytes (no multipart needed → trivial upload
+    progress on the client). Same API surface as backend/app_serverless.py's
+    chunked endpoints below — the desktop client always uses those instead so
+    it doesn't need to know which host it's talking to.
+    """
+    fname = request.headers.get("x-filename", "audio.mp3")
+    body = await request.body()
+    return _start_transcription(body, fname)
+
+
+@app.post("/transcribe/init")
+async def transcribe_init() -> dict:
+    upload_id = uuid.uuid4().hex[:12]
+    with _UPLOAD_LOCK:
+        _UPLOADS[upload_id] = {}
+    return {"upload_id": upload_id}
+
+
+@app.post("/transcribe/chunk/{upload_id}")
+async def transcribe_chunk(upload_id: str, request: Request) -> dict:
+    idx_header = request.headers.get("x-chunk-index")
+    if idx_header is None:
+        raise HTTPException(status_code=400, detail="Missing X-Chunk-Index header")
+    body = await request.body()
+    with _UPLOAD_LOCK:
+        chunks = _UPLOADS.get(upload_id)
+        if chunks is None:
+            raise HTTPException(status_code=404, detail="Unknown upload_id (server may have restarted)")
+        chunks[int(idx_header)] = body
+    return {"ok": True}
+
+
+@app.post("/transcribe/finish/{upload_id}")
+async def transcribe_finish(upload_id: str, request: Request) -> dict:
+    payload = await request.json()
+    fname = str(payload.get("filename") or "audio.mp3")
+    with _UPLOAD_LOCK:
+        chunks = _UPLOADS.pop(upload_id, None)
+    if chunks is None:
+        raise HTTPException(status_code=404, detail="Unknown upload_id (server may have restarted)")
+    body = b"".join(chunks[i] for i in sorted(chunks))
+    return _start_transcription(body, fname)
 
 
 @app.post("/select")

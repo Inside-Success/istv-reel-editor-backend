@@ -24,3 +24,6 @@ input/*
 
 # Local durable job registry (backend/job_store.py)
 backend/jobs.db
+.vercel
+.env*
+Updated-Reels-Tool/

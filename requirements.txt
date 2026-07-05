@@ -4,3 +4,8 @@ anthropic>=0.50.0
 python-docx>=1.1.0
 Pillow>=10.0.0
 numpy>=1.24.0
+
+# Needed by api/index.py (Vercel serverless backend) — Vercel's Python builder
+# installs from this root requirements.txt, not backend/requirements.txt.
+fastapi>=0.110.0
+psycopg[binary]>=3.1.0
