@@ -312,7 +312,7 @@ async def transcribe_finish(upload_id: str, request: Request) -> dict:
 async def select(request: Request) -> dict:
     """Receive a word-level transcript + params, return Claude reel cut instructions.
 
-    Body JSON: { "transcript": {...}, "name": "Speaker Name", "num_reels": 10 }
+    Body JSON: { "transcript": {...}, "name": "Speaker Name", "num_reels": 15 }
     """
     payload = await request.json()
     transcript = payload.get("transcript")
@@ -320,9 +320,9 @@ async def select(request: Request) -> dict:
         raise HTTPException(status_code=400, detail="Missing transcript.words")
     name = str(payload.get("name") or "").strip()
     try:
-        num_reels = int(payload.get("num_reels") or 10)
+        num_reels = int(payload.get("num_reels") or 15)
     except (TypeError, ValueError):
-        num_reels = 10
+        num_reels = 15
 
     job_id = uuid.uuid4().hex[:12]
     _create(
@@ -414,7 +414,7 @@ def _bootstrap_jobs() -> None:
                 _set(job_id, resume_attempts=attempts + 1)
                 threading.Thread(
                     target=_run_selection,
-                    args=(job_id, transcript, data.get("name") or "", data.get("num_reels") or 10),
+                    args=(job_id, transcript, data.get("name") or "", data.get("num_reels") or 15),
                     kwargs={"cleaned_words": data.get("cleaned_words")},
                     daemon=True,
                 ).start()
