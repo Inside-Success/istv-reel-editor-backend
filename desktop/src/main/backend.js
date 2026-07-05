@@ -50,50 +50,70 @@ async function health() {
   return getJSON(`${BACKEND_URL}/health`);
 }
 
-/**
- * Upload an audio file to POST /transcribe as raw bytes, reporting upload
- * progress (0..1). Resolves to the backend's { job_id }.
- */
-function uploadAudio(audioPath, { onProgress } = {}) {
+// Kept well under Vercel serverless functions' ~4.5 MB hard request-body cap
+// (hit as "413 FUNCTION_PAYLOAD_TOO_LARGE" for anything bigger sent in one
+// shot) — the Render backend has no such limit but accepts the same chunked
+// API, so the client always chunks rather than needing to know which host
+// it's talking to.
+const UPLOAD_CHUNK_BYTES = 3 * 1024 * 1024;
+
+/** POST a raw byte buffer to `${BACKEND_URL}${pathName}`, returning parsed JSON. */
+function postBuffer(pathName, buf, { headers = {}, timeoutMs = 30000 } = {}) {
   return new Promise((resolve, reject) => {
-    const u = new URL(`${BACKEND_URL}/transcribe`);
-    const total = fs.statSync(audioPath).size;
-    let sent = 0;
-
-    const req = lib(u).request(u, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/octet-stream",
-        "Content-Length": total,
-        "X-Filename": path.basename(audioPath),
+    const u = new URL(`${BACKEND_URL}${pathName}`);
+    const req = lib(u).request(
+      u,
+      {
+        method: "POST",
+        timeout: timeoutMs,
+        headers: { "Content-Type": "application/octet-stream", "Content-Length": buf.length, ...headers },
       },
-    });
-
-    req.on("response", (res) => {
-      let body = "";
-      res.on("data", (d) => (body += d));
-      res.on("end", () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try {
-            resolve(JSON.parse(body));
-          } catch (e) {
-            reject(new Error("Bad JSON from /transcribe: " + e.message));
+      (res) => {
+        let body = "";
+        res.on("data", (d) => (body += d));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              resolve(JSON.parse(body));
+            } catch (e) {
+              reject(new Error(`Bad JSON from ${pathName}: ${e.message}`));
+            }
+          } else {
+            reject(new Error(`Upload failed ${res.statusCode}: ${body.slice(0, 300)}`));
           }
-        } else {
-          reject(new Error(`Upload failed ${res.statusCode}: ${body.slice(0, 300)}`));
-        }
-      });
-    });
+        });
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error(`Request to ${pathName} timed out`)));
     req.on("error", reject);
-
-    const stream = fs.createReadStream(audioPath);
-    stream.on("data", (chunk) => {
-      sent += chunk.length;
-      if (onProgress) onProgress(Math.min(1, sent / total));
-    });
-    stream.on("error", reject);
-    stream.pipe(req);
+    req.end(buf);
   });
+}
+
+/**
+ * Upload an audio file in fixed-size chunks (POST /transcribe/init, then one
+ * POST /transcribe/chunk/{id} per piece, then POST /transcribe/finish/{id}),
+ * reporting upload progress (0..1). Resolves to the backend's { job_id }.
+ */
+async function uploadAudio(audioPath, { onProgress } = {}) {
+  const filename = path.basename(audioPath);
+  const data = fs.readFileSync(audioPath);
+  const total = data.length;
+
+  const { upload_id } = await postJSON("/transcribe/init", {});
+
+  let sent = 0;
+  for (let offset = 0; offset < total; offset += UPLOAD_CHUNK_BYTES) {
+    const index = offset / UPLOAD_CHUNK_BYTES;
+    const chunk = data.subarray(offset, Math.min(offset + UPLOAD_CHUNK_BYTES, total));
+    await postBuffer(`/transcribe/chunk/${upload_id}`, chunk, {
+      headers: { "X-Chunk-Index": String(index) },
+    });
+    sent += chunk.length;
+    if (onProgress) onProgress(Math.min(1, sent / total));
+  }
+
+  return postJSON(`/transcribe/finish/${upload_id}`, { filename });
 }
 
 /** POST JSON to a path, returning the parsed response. */
