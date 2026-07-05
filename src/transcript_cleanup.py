@@ -67,6 +67,103 @@ def _parse_json(text: str) -> dict:
         return {"fixes": []}
 
 
+def _fetch_chunk_fixes(
+    client: Anthropic,
+    out: list[dict],
+    start: int,
+    end: int,
+    ctx_lo: int,
+    ctx_hi: int,
+    model: str,
+    hint: str,
+    progress_cb=None,
+) -> list[dict]:
+    numbered = "\n".join(f"{i}: {out[i].get('word','')}" for i in range(ctx_lo, ctx_hi))
+    user = (
+        f"{hint}Correct ONLY indices {start}..{end - 1} (surrounding lines are context).\n\n"
+        f"{numbered}"
+    )
+    fixes: list[dict] = []
+    last_exc: Exception | None = None
+    for retry in range(_CHUNK_RETRY_ATTEMPTS + 1):
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=2000,
+                system=_CLEAN_SYSTEM,
+                messages=[{"role": "user", "content": user}],
+            )
+            raw = "".join(b.text for b in resp.content if hasattr(b, "text"))
+            fixes = _parse_json(raw).get("fixes") or []
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001 - non-retryable path falls through below
+            if not _is_retryable(exc):
+                last_exc = exc
+                break
+            last_exc = exc
+            if retry < _CHUNK_RETRY_ATTEMPTS:
+                delay = min(_CHUNK_RETRY_MAX_DELAY, _CHUNK_RETRY_DELAY * (retry + 1))
+                if progress_cb:
+                    progress_cb(f"transcript cleanup chunk {start}-{end}: {exc}; retrying in {delay:.0f}s...")
+                time.sleep(delay)
+    if last_exc is not None:
+        if progress_cb:
+            progress_cb(f"transcript cleanup chunk {start}-{end} skipped: {last_exc}")
+        return []
+    return fixes
+
+
+def correct_transcript_words_step(
+    words: list[dict],
+    start: int,
+    *,
+    model: str,
+    api_key: str,
+    speaker_name: str = "",
+    client: Anthropic | None = None,
+    progress_cb=None,
+) -> tuple[list[dict], int, bool]:
+    """Correct exactly ONE chunk (CHUNK_TOKENS words) starting at `start`.
+
+    Returns (updated_words, next_start, done). Bounded to a single Claude call
+    (plus its own retries) so a caller that can't hold a process open across
+    the whole transcript — a serverless request with a hard execution-time
+    limit — can make one poll do one chunk and resume from `next_start` on the
+    next poll. `words` is expected to already carry any earlier chunks' fixes;
+    it's copied and returned so callers can just re-save the result.
+    """
+    out = [dict(w) for w in words]
+    n = len(out)
+    if n == 0 or start >= n:
+        return out, n, True
+
+    if client is None:
+        client = Anthropic(api_key=api_key)
+    hint = f"Speaker name (spell exactly like this when it appears): {speaker_name}\n\n" if speaker_name else ""
+
+    end = min(n, start + CHUNK_TOKENS)
+    ctx_lo = max(0, start - CONTEXT_TOKENS)
+    ctx_hi = min(n, end + CONTEXT_TOKENS)
+    fixes = _fetch_chunk_fixes(client, out, start, end, ctx_lo, ctx_hi, model, hint, progress_cb)
+
+    for fix in fixes:
+        try:
+            i = int(fix.get("i"))
+            w = str(fix.get("w") or "").strip()
+        except (TypeError, ValueError):
+            continue
+        if not (start <= i < end):
+            continue
+        if not w or " " in w or "\t" in w:
+            continue  # must stay a single token to preserve timing
+        if w == str(out[i].get("word") or ""):
+            continue
+        out[i]["word"] = w
+
+    return out, end, end >= n
+
+
 def correct_transcript_words(
     words: list[dict],
     *,
@@ -75,72 +172,31 @@ def correct_transcript_words(
     progress_cb=None,
     speaker_name: str = "",
 ) -> tuple[list[dict], int]:
-    """Return (corrected_words, num_fixes). Timing/indices preserved exactly."""
+    """Return (corrected_words, num_fixes). Timing/indices preserved exactly.
+
+    Loops correct_transcript_words_step to completion — fine for a caller
+    that can hold the process open for the whole transcript (a background
+    thread; see backend/app.py). Serverless callers instead drive the step
+    function directly, one poll per chunk — see backend/app_serverless.py.
+    """
     if not words:
         return words, 0
 
     client = Anthropic(api_key=api_key)
-    out = [dict(w) for w in words]
-    n = len(out)
-    total_fixes = 0
-    hint = f"Speaker name (spell exactly like this when it appears): {speaker_name}\n\n" if speaker_name else ""
-
+    out = list(words)
     start = 0
-    while start < n:
-        end = min(n, start + CHUNK_TOKENS)
-        ctx_lo = max(0, start - CONTEXT_TOKENS)
-        ctx_hi = min(n, end + CONTEXT_TOKENS)
-        numbered = "\n".join(f"{i}: {out[i].get('word','')}" for i in range(ctx_lo, ctx_hi))
-        user = (
-            f"{hint}Correct ONLY indices {start}..{end - 1} (surrounding lines are context).\n\n"
-            f"{numbered}"
+    while start < len(out):
+        out, start, _done = correct_transcript_words_step(
+            out,
+            start,
+            model=model,
+            api_key=api_key,
+            speaker_name=speaker_name,
+            client=client,
+            progress_cb=progress_cb,
         )
-        fixes = []
-        last_exc: Exception | None = None
-        for retry in range(_CHUNK_RETRY_ATTEMPTS + 1):
-            try:
-                resp = client.messages.create(
-                    model=model,
-                    max_tokens=2000,
-                    system=_CLEAN_SYSTEM,
-                    messages=[{"role": "user", "content": user}],
-                )
-                raw = "".join(b.text for b in resp.content if hasattr(b, "text"))
-                fixes = _parse_json(raw).get("fixes") or []
-                last_exc = None
-                break
-            except Exception as exc:  # noqa: BLE001 - non-retryable path falls through below
-                if not _is_retryable(exc):
-                    last_exc = exc
-                    break
-                last_exc = exc
-                if retry < _CHUNK_RETRY_ATTEMPTS:
-                    delay = min(_CHUNK_RETRY_MAX_DELAY, _CHUNK_RETRY_DELAY * (retry + 1))
-                    if progress_cb:
-                        progress_cb(f"transcript cleanup chunk {start}-{end}: {exc}; retrying in {delay:.0f}s...")
-                    time.sleep(delay)
-        if last_exc is not None:
-            fixes = []
-            if progress_cb:
-                progress_cb(f"transcript cleanup chunk {start}-{end} skipped: {last_exc}")
 
-        for fix in fixes:
-            try:
-                i = int(fix.get("i"))
-                w = str(fix.get("w") or "").strip()
-            except (TypeError, ValueError):
-                continue
-            if not (start <= i < end):
-                continue
-            if not w or " " in w or "\t" in w:
-                continue  # must stay a single token to preserve timing
-            if w == str(out[i].get("word") or ""):
-                continue
-            out[i]["word"] = w
-            total_fixes += 1
-
-        start = end
-
+    total_fixes = sum(1 for a, b in zip(words, out) if a.get("word") != b.get("word"))
     if progress_cb:
         progress_cb(f"transcript cleanup: {total_fixes} token fix(es)")
     return out, total_fixes

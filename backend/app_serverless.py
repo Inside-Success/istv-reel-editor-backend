@@ -8,9 +8,12 @@ completely different function instance — can pick up where the last one left
 off.
 
   POST /transcribe   raw audio body -> submits a Rev.ai job, returns immediately
-  GET  /jobs/{id}    each call does ONE bounded step (check Rev.ai status, run
-                     the transcript-cleanup pass, or run Claude reel selection)
-                     instead of blocking for the whole job's duration
+  GET  /jobs/{id}    each call does ONE bounded Claude call at most (check
+                     Rev.ai status, correct ONE transcript-cleanup chunk, run
+                     reel selection, or run brand-story extraction) instead of
+                     blocking for the whole job's duration — a full cleanup
+                     pass alone is 15-20+ sequential Claude calls for a long
+                     transcript, far more than one request should ever do
   POST /select       transcript + params -> queues the Claude reel-selection job
   GET  /health       liveness + which keys/DB are configured
 
@@ -38,9 +41,16 @@ load_dotenv(ROOT / ".env")
 
 from backend import job_store_pg as store  # noqa: E402
 from src.transcription import check_transcription_job_once, submit_transcription_job  # noqa: E402
-from src.transcript_cleanup import correct_transcript_words  # noqa: E402
-from src.analyzer import analyze_with_claude, DEFAULT_CLAUDE_MODEL  # noqa: E402
+from src.transcript_cleanup import correct_transcript_words_step  # noqa: E402
+from src.analyzer import (  # noqa: E402
+    DEFAULT_CLAUDE_MODEL,
+    extract_brand_story,
+    finalize_analysis,
+    prepare_segments,
+    select_reels,
+)
 from generate_reels import DEFAULT_PROFILE, apply_profile, detect_name_aliases  # noqa: E402
+from anthropic import Anthropic  # noqa: E402
 
 app = FastAPI(title="ISTV Reel Editor Backend (serverless)", version="0.1.0")
 
@@ -184,6 +194,8 @@ async def select(request: Request) -> dict:
             "name": name,
             "num_reels": num_reels,
             "cleaned_words": None,
+            "cleanup_index": 0,
+            "selection_raw": None,
         },
     )
     return {"job_id": job_id}
@@ -228,27 +240,61 @@ def _advance_select(job: dict) -> dict:
             os.environ["REEL_NAME_ALIASES"] = ",".join(f"{k}={v}" for k, v in aliases.items())
 
     try:
-        if job["status"] == "queued":
-            # Step 1 of 2 — this request blocks only for the cleanup call's
-            # duration, not the whole job; the next poll runs step 2.
-            job["message"] = "Cleaning transcript…"
-            fixed_words, _n = correct_transcript_words(
-                transcript.get("words") or [],
-                model=DEFAULT_CLAUDE_MODEL,
-                api_key=key,
-                speaker_name=name,
+        if job["status"] in ("queued", "cleaning"):
+            # Step 1 — ONE cleanup chunk per poll (not the whole transcript;
+            # see correct_transcript_words_step), checkpointing progress in
+            # cleaned_words/cleanup_index so the next poll picks up where this
+            # one left off. `cleaned_words` starts as None on a fresh job.
+            words = job.get("cleaned_words")
+            if words is None:
+                words = transcript.get("words") or []
+            start = int(job.get("cleanup_index") or 0)
+            updated, next_start, done = correct_transcript_words_step(
+                words, start, model=DEFAULT_CLAUDE_MODEL, api_key=key, speaker_name=name,
             )
-            job.update(status="selecting", cleaned_words=fixed_words, message="Selecting reels with Claude…")
-        elif job["status"] == "selecting":
-            # Step 2 of 2, using step 1's checkpoint — never redoes cleanup.
-            active = {**transcript, "words": job["cleaned_words"]}
-            analysis = analyze_with_claude(
-                dict(active), DEFAULT_CLAUDE_MODEL, key, num_reels=num_reels, story_mode=False,
+            job["cleaned_words"] = updated
+            job["cleanup_index"] = next_start
+            if done:
+                job.update(status="selecting_reels", message="Selecting reels with Claude…")
+            else:
+                job.update(status="cleaning", message=f"Cleaning transcript… ({next_start}/{len(updated)} words)")
+        elif job["status"] == "selecting_reels":
+            # Step 2 — the reel-selection call, using step 1's checkpoint.
+            words, segments, segmented_text, _duration = prepare_segments(transcript, job.get("cleaned_words"))
+            client = Anthropic(api_key=key)
+            selection = select_reels(
+                segments,
+                story_mode=False,
+                num_reels=num_reels,
+                model=DEFAULT_CLAUDE_MODEL,
+                client=client,
+                segmented_text=segmented_text,
+            )
+            job["selection_raw"] = selection
+            job.update(status="brand_story", message="Crafting brand story…")
+        elif job["status"] == "brand_story":
+            # Step 3 — the brand-story call, then finalize (pure Python, no
+            # further Claude calls) using both raw results.
+            words, segments, segmented_text, duration_str = prepare_segments(transcript, job.get("cleaned_words"))
+            client = Anthropic(api_key=key)
+            brand = extract_brand_story(client, DEFAULT_CLAUDE_MODEL, segmented_text, duration_str)
+            selection = job.get("selection_raw") or {}
+            analysis = finalize_analysis(
+                selection.get("reels") or [],
+                str(selection.get("documentary_summary") or "").strip(),
+                selection.get("recommendations") or {},
+                brand,
+                words,
+                segments,
+                float(transcript.get("duration") or 0),
+                num_reels=num_reels,
+                story_mode=False,
             )
             job.update(
                 status="done",
                 analysis=analysis,
                 cleaned_words=None,
+                selection_raw=None,
                 message=f"{len(analysis.get('reels') or [])} reels selected",
             )
     except Exception as exc:

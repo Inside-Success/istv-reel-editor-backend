@@ -261,6 +261,63 @@ def _length_rule() -> str:
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
+def prepare_segments(transcript: dict, words: list[dict] | None = None):
+    """Pure-Python prep (no Claude calls): normalize word timings, build
+    sentence segments, and format them for the Claude prompt.
+
+    Split out of analyze_with_claude so it can be called more than once (e.g.
+    once per resumable serverless step, since it's cheap) without repeating
+    any of the LLM work. Returns (normalized_words, segments, segmented_text,
+    duration_str).
+    """
+    raw_words = words if words is not None else (transcript.get("words") or [])
+    norm_words = normalize_word_timings(raw_words)
+    segments = build_sentence_segments(norm_words, float(transcript.get("duration") or 0))
+    segmented_text = format_segments_for_claude(segments)
+    duration_str = fmt_time(transcript.get("duration") or 0)
+    return norm_words, segments, segmented_text, duration_str
+
+
+def finalize_analysis(
+    reels_raw: list,
+    documentary_summary: str,
+    recommendations: dict,
+    brand: dict,
+    words: list[dict],
+    segments: list[dict],
+    duration_seconds: float,
+    *,
+    num_reels: int = DEFAULT_NUM_REELS,
+    story_mode: bool = False,
+) -> dict:
+    """Turn raw Claude output (reel selection + brand story) into the final
+    analysis dict. Pure Python, no further LLM calls — split out of
+    analyze_with_claude so a caller that ran the two Claude calls as separate
+    bounded steps (see backend/app_serverless.py) can finalize once both are
+    in hand, same as the single-shot path below does inline.
+    """
+    reels = [_normalize_claude_reel(row, idx + 1) for idx, row in enumerate(reels_raw)]
+    reels.sort(key=lambda r: int(r.get("rank") or r.get("id") or 999))
+    for idx, reel in enumerate(reels, start=1):
+        reel["id"] = int(reel.get("rank") or idx)
+    reels = reels[:num_reels]
+
+    analysis = {
+        "reels": reels,
+        "brand_story": brand,
+        "documentary_summary": documentary_summary,
+        "recommendations": normalize_recommendations(recommendations or {}),
+        "story_mode": story_mode,
+        "segment_count": len(segments),
+        "utterance_segments": segments,
+        "sentence_segments": segments,
+    }
+    _normalize_cut_sheets(analysis, words, segments, float(duration_seconds or 0), story_mode=story_mode)
+    _attach_verbatim_for_segments(analysis, {"words": words})
+    _attach_words(analysis, words)
+    return analysis
+
+
 def analyze_with_claude(
     transcript: dict,
     model: str,
@@ -278,11 +335,7 @@ def analyze_with_claude(
         num_reels = DEFAULT_NUM_REELS
 
     client = Anthropic(api_key=api_key)
-    words = normalize_word_timings(transcript.get("words") or [])
-    transcript = {**transcript, "words": words}
-    segments = build_sentence_segments(words, float(transcript.get("duration") or 0))
-    segmented_text = format_segments_for_claude(segments)
-    duration = fmt_time(transcript["duration"])
+    words, segments, segmented_text, duration = prepare_segments(transcript)
 
     _log(progress_cb, f"Built {len(segments)} sentence segments from {len(words):,} words")
     mode_label = "ON (4-5 part series)" if story_mode else "OFF (all standalone)"
@@ -302,44 +355,28 @@ def analyze_with_claude(
     )
     reels_raw = selection.get("reels") or []
     documentary_summary = str(selection.get("documentary_summary") or "").strip()
-    recommendations = normalize_recommendations(selection.get("recommendations") or {})
-
-    reels = [_normalize_claude_reel(row, idx + 1) for idx, row in enumerate(reels_raw)]
-    reels.sort(key=lambda r: int(r.get("rank") or r.get("id") or 999))
-    for idx, reel in enumerate(reels, start=1):
-        reel["id"] = int(reel.get("rank") or idx)
-    reels = reels[:num_reels]
+    recommendations = selection.get("recommendations") or {}
 
     _log(progress_cb, "Crafting brand story...")
     brand = _call_with_retries(
-        lambda: _extract_brand_story(client, model, segmented_text, duration),
+        lambda: extract_brand_story(client, model, segmented_text, duration),
         progress_cb=progress_cb,
         label="Brand story extraction",
     )
 
-    analysis = {
-        "reels": reels,
-        "brand_story": brand,
-        "documentary_summary": documentary_summary,
-        "recommendations": recommendations,
-        "story_mode": story_mode,
-        "segment_count": len(segments),
-        "utterance_segments": segments,
-        "sentence_segments": segments,
-    }
-    _normalize_cut_sheets(
-        analysis,
+    _log(progress_cb, "Filling verbatim transcript text for each cut window...")
+    analysis = finalize_analysis(
+        reels_raw,
+        documentary_summary,
+        recommendations,
+        brand,
         words,
         segments,
         float(transcript.get("duration") or 0),
+        num_reels=num_reels,
         story_mode=story_mode,
     )
-
-    _log(progress_cb, "Filling verbatim transcript text for each cut window...")
-    _attach_verbatim_for_segments(analysis, transcript)
-
     _log(progress_cb, "Attaching Rev.ai word timestamps to each reel...")
-    _attach_words(analysis, words)
 
     return analysis
 
@@ -556,7 +593,7 @@ def _segments_to_cut_sheet(segments: list) -> list[dict]:
 
 # ── Pass 2: Brand story ────────────────────────────────────────────────────────
 
-def _extract_brand_story(
+def extract_brand_story(
     client: Anthropic, model: str, segmented_text: str, duration: str
 ) -> dict:
     prompt = f"""You are an elite brand storyteller, SEO copywriter, and content strategist.

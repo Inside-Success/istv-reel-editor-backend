@@ -55,7 +55,13 @@ async function health() {
 // shot) — the Render backend has no such limit but accepts the same chunked
 // API, so the client always chunks rather than needing to know which host
 // it's talking to.
-const UPLOAD_CHUNK_BYTES = 3 * 1024 * 1024;
+//
+// 3 MB still tripped the 413 in practice: Vercel's Python runtime relays
+// binary request bodies through an API-Gateway-style bridge that base64s
+// them in transit, inflating a 3 MB chunk to ~4 MB before it's measured
+// against the cap — almost no margin left once headers are added. Dropped
+// to 1.5 MB so the post-encoding size stays well clear of the limit.
+const UPLOAD_CHUNK_BYTES = 1.5 * 1024 * 1024;
 
 /** POST a raw byte buffer to `${BACKEND_URL}${pathName}`, returning parsed JSON. */
 function postBuffer(pathName, buf, { headers = {}, timeoutMs = 30000 } = {}) {
@@ -150,6 +156,16 @@ function postJSON(pathName, obj, { timeoutMs = 20000 } = {}) {
   });
 }
 
+// On the serverless backend, a single GET /jobs/{id} poll can itself run one
+// bounded Claude call synchronously (a transcript-cleanup chunk, the reel
+// selection call, or the brand-story call — see backend/app_serverless.py's
+// _advance_select) before responding, rather than just reading cached status.
+// That can legitimately take tens of seconds, well past a typical "is this
+// server up" timeout, so each poll request gets much more slack than
+// getJSON's 15s default — otherwise a slow-but-healthy step reads as
+// "Backend request timed out" and fails the whole selection step for nothing.
+const POLL_REQUEST_TIMEOUT_MS = 90 * 1000;
+
 /**
  * Poll GET /jobs/{id} until status is done/error. Calls onStatus each tick.
  * Resolves with the full final status object (has .transcript or .analysis).
@@ -158,7 +174,7 @@ async function pollJob(jobId, { onStatus, intervalMs = 2500, timeoutMs = 30 * 60
   const start = Date.now();
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const s = await getJSON(`${BACKEND_URL}/jobs/${jobId}`);
+    const s = await getJSON(`${BACKEND_URL}/jobs/${jobId}`, { timeoutMs: POLL_REQUEST_TIMEOUT_MS });
     if (onStatus) onStatus(s);
     if (s.status === "done") return s;
     if (s.status === "error") throw new Error(s.error || "Job failed");
