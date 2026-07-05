@@ -1,0 +1,22 @@
+{
+  "name": "istv-reel-editor",
+  "productName": "ISTV Reel Editor",
+  "version": "0.1.0",
+  "description": "Cross-platform desktop editor that turns a documentary into 9:16 reels.",
+  "main": "src/main/main.js",
+  "author": "ISTV",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "node scripts/launch.js",
+    "smoke": "node scripts/launch.js --smoke",
+    "test": "node test/model.test.js"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0"
+  }
+}
