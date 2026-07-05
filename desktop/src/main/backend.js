@@ -63,6 +63,30 @@ async function health() {
 // to 1.5 MB so the post-encoding size stays well clear of the limit.
 const UPLOAD_CHUNK_BYTES = 1.5 * 1024 * 1024;
 
+// postBuffer's 30s default timeout is tuned for small JSON-ish payloads, not
+// a 1.5 MB binary chunk — on an upload link slower than ~700 kbps (common on
+// home wifi/VPNs), just transmitting one chunk can take 20-30s before the
+// server even finishes reading it, tripping the timeout and failing the
+// whole multi-chunk upload with no way to recover. Chunks get their own much
+// longer budget, plus retries below since a slow link makes an occasional
+// timeout or dropped connection expected rather than exceptional.
+const CHUNK_UPLOAD_TIMEOUT_MS = 120 * 1000;
+const CHUNK_UPLOAD_MAX_ATTEMPTS = 4;
+
+/** Re-POST the same chunk on failure — chunk upload is idempotent (the
+ * server keys each chunk by its index and overwrites on repeat), so retrying
+ * after a timeout or dropped connection is always safe. */
+async function postBufferWithRetry(pathName, buf, opts) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await postBuffer(pathName, buf, opts);
+    } catch (err) {
+      if (attempt >= CHUNK_UPLOAD_MAX_ATTEMPTS) throw err;
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
+}
+
 /** POST a raw byte buffer to `${BACKEND_URL}${pathName}`, returning parsed JSON. */
 function postBuffer(pathName, buf, { headers = {}, timeoutMs = 30000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -112,8 +136,9 @@ async function uploadAudio(audioPath, { onProgress } = {}) {
   for (let offset = 0; offset < total; offset += UPLOAD_CHUNK_BYTES) {
     const index = offset / UPLOAD_CHUNK_BYTES;
     const chunk = data.subarray(offset, Math.min(offset + UPLOAD_CHUNK_BYTES, total));
-    await postBuffer(`/transcribe/chunk/${upload_id}`, chunk, {
+    await postBufferWithRetry(`/transcribe/chunk/${upload_id}`, chunk, {
       headers: { "X-Chunk-Index": String(index) },
+      timeoutMs: CHUNK_UPLOAD_TIMEOUT_MS,
     });
     sent += chunk.length;
     if (onProgress) onProgress(Math.min(1, sent / total));
