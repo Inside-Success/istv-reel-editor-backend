@@ -185,11 +185,15 @@ function postJSON(pathName, obj, { timeoutMs = 20000 } = {}) {
 // bounded Claude call synchronously (a transcript-cleanup chunk, the reel
 // selection call, or the brand-story call — see backend/app_serverless.py's
 // _advance_select) before responding, rather than just reading cached status.
-// That can legitimately take tens of seconds, well past a typical "is this
-// server up" timeout, so each poll request gets much more slack than
-// getJSON's 15s default — otherwise a slow-but-healthy step reads as
-// "Backend request timed out" and fails the whole selection step for nothing.
-const POLL_REQUEST_TIMEOUT_MS = 90 * 1000;
+// That call retries internally up to 6 times on transient Claude errors
+// (_call_with_retries in src/analyzer.py) with backoff capped at 30s —
+// 2+4+8+16+30+30 = 90s of backoff alone, before counting any of the actual
+// Claude round-trips, which get slower as the source video (and prompt) grows.
+// 90s was tripping on legitimately slow-but-healthy calls, so this now gives
+// each poll request much more slack than getJSON's 15s default — otherwise a
+// slow-but-healthy step reads as "Backend request timed out" and fails the
+// whole selection step for nothing.
+const POLL_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * Poll GET /jobs/{id} until status is done/error. Calls onStatus each tick.
