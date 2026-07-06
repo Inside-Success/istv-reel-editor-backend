@@ -44,6 +44,7 @@ from src.transcription import check_transcription_job_once, submit_transcription
 from src.transcript_cleanup import correct_transcript_words_step  # noqa: E402
 from src.analyzer import (  # noqa: E402
     DEFAULT_CLAUDE_MODEL,
+    _is_retryable_claude_error,
     extract_brand_story,
     finalize_analysis,
     prepare_segments,
@@ -196,6 +197,8 @@ async def select(request: Request) -> dict:
             "cleaned_words": None,
             "cleanup_index": 0,
             "selection_raw": None,
+            "select_attempts": 0,
+            "brand_attempts": 0,
         },
     )
     return {"job_id": job_id}
@@ -219,6 +222,19 @@ def _advance_transcribe(job: dict) -> dict:
             message=f"{transcript['word_count']:,} words, {transcript['duration']:.0f}s",
         )
     return job
+
+
+# A single "selecting_reels" or "brand_story" poll makes one synchronous
+# Claude call. Vercel hard-kills a function at its configured maxDuration
+# (see vercel.json) by dropping the connection outright — the client sees a
+# bare ECONNRESET, not a JSON error, and the job's status never advances past
+# this step, so every subsequent poll retries the exact same slow call and
+# gets killed the exact same way. Capping the Claude call itself well under
+# that ceiling turns a platform-level kill (silent, unrecoverable) into a
+# normal APITimeoutError this code can catch and retry across polls instead
+# of within one request.
+_CLAUDE_CALL_TIMEOUT_S = 240.0
+_MAX_STEP_ATTEMPTS = 6
 
 
 def _advance_select(job: dict) -> dict:
@@ -261,23 +277,39 @@ def _advance_select(job: dict) -> dict:
         elif job["status"] == "selecting_reels":
             # Step 2 — the reel-selection call, using step 1's checkpoint.
             words, segments, segmented_text, _duration = prepare_segments(transcript, job.get("cleaned_words"))
-            client = Anthropic(api_key=key)
-            selection = select_reels(
-                segments,
-                story_mode=False,
-                num_reels=num_reels,
-                model=DEFAULT_CLAUDE_MODEL,
-                client=client,
-                segmented_text=segmented_text,
-            )
+            client = Anthropic(api_key=key, timeout=_CLAUDE_CALL_TIMEOUT_S)
+            try:
+                selection = select_reels(
+                    segments,
+                    story_mode=False,
+                    num_reels=num_reels,
+                    model=DEFAULT_CLAUDE_MODEL,
+                    client=client,
+                    segmented_text=segmented_text,
+                )
+            except Exception as exc:
+                attempts = int(job.get("select_attempts") or 0) + 1
+                job["select_attempts"] = attempts
+                if _is_retryable_claude_error(exc) and attempts < _MAX_STEP_ATTEMPTS:
+                    job.update(message=f"Selecting reels with Claude… (retry {attempts}/{_MAX_STEP_ATTEMPTS} after {exc})")
+                    return job
+                raise
             job["selection_raw"] = selection
             job.update(status="brand_story", message="Crafting brand story…")
         elif job["status"] == "brand_story":
             # Step 3 — the brand-story call, then finalize (pure Python, no
             # further Claude calls) using both raw results.
             words, segments, segmented_text, duration_str = prepare_segments(transcript, job.get("cleaned_words"))
-            client = Anthropic(api_key=key)
-            brand = extract_brand_story(client, DEFAULT_CLAUDE_MODEL, segmented_text, duration_str)
+            client = Anthropic(api_key=key, timeout=_CLAUDE_CALL_TIMEOUT_S)
+            try:
+                brand = extract_brand_story(client, DEFAULT_CLAUDE_MODEL, segmented_text, duration_str)
+            except Exception as exc:
+                attempts = int(job.get("brand_attempts") or 0) + 1
+                job["brand_attempts"] = attempts
+                if _is_retryable_claude_error(exc) and attempts < _MAX_STEP_ATTEMPTS:
+                    job.update(message=f"Crafting brand story… (retry {attempts}/{_MAX_STEP_ATTEMPTS} after {exc})")
+                    return job
+                raise
             selection = job.get("selection_raw") or {}
             analysis = finalize_analysis(
                 selection.get("reels") or [],
