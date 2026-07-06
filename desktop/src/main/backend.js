@@ -195,15 +195,49 @@ function postJSON(pathName, obj, { timeoutMs = 20000 } = {}) {
 // whole selection step for nothing.
 const POLL_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
+// A poll tick can legitimately take minutes (the backend runs a synchronous
+// Claude call inside that request), which gives an in-flight TCP connection
+// a long window to get reset by a flaky wifi link, VPN, or intermediary
+// proxy. That's a transient network blip, not a job failure — the backend
+// call it interrupted already has its own retry/backoff (_call_with_retries
+// in src/analyzer.py). Without this, one dropped connection anywhere in a
+// 30-minute polling loop threw straight out and failed the whole step.
+const POLL_TRANSIENT_CODES = new Set([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "EPIPE",
+  "EAI_AGAIN",
+  "ENOTFOUND",
+]);
+const POLL_MAX_CONSECUTIVE_ERRORS = 8;
+
+function isTransientPollError(err) {
+  return POLL_TRANSIENT_CODES.has(err.code) || /timed out/i.test(err.message || "");
+}
+
 /**
  * Poll GET /jobs/{id} until status is done/error. Calls onStatus each tick.
  * Resolves with the full final status object (has .transcript or .analysis).
  */
 async function pollJob(jobId, { onStatus, intervalMs = 2500, timeoutMs = 30 * 60 * 1000 } = {}) {
   const start = Date.now();
+  let consecutiveErrors = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const s = await getJSON(`${BACKEND_URL}/jobs/${jobId}`, { timeoutMs: POLL_REQUEST_TIMEOUT_MS });
+    let s;
+    try {
+      s = await getJSON(`${BACKEND_URL}/jobs/${jobId}`, { timeoutMs: POLL_REQUEST_TIMEOUT_MS });
+      consecutiveErrors = 0;
+    } catch (err) {
+      consecutiveErrors += 1;
+      if (!isTransientPollError(err) || consecutiveErrors >= POLL_MAX_CONSECUTIVE_ERRORS) throw err;
+      if (onStatus) {
+        onStatus({ status: "active", message: `Connection hiccup (${err.code || err.message}); retrying...` });
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+      continue;
+    }
     if (onStatus) onStatus(s);
     if (s.status === "done") return s;
     if (s.status === "error") throw new Error(s.error || "Job failed");
