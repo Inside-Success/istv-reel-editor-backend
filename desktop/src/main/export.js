@@ -16,8 +16,8 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const ffmpeg = require("./ffmpeg");
+const { resolvePython, REPO_ROOT } = require("./python");
 
-const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const EXPORT_CLI = path.join(REPO_ROOT, "export_cli.py");
 
 const RESOLUTIONS = {
@@ -32,14 +32,6 @@ const RESOLUTIONS = {
 const QUALITY = { Lower: "low", Recommended: "medium", Higher: "high" };
 // Faster x264 presets for snappier desktop exports (CRF still governs quality).
 const PRESET = { Lower: "veryfast", Recommended: "faster", Higher: "medium" };
-
-function resolvePython() {
-  const win = path.join(REPO_ROOT, ".venv", "Scripts", "python.exe");
-  const nix = path.join(REPO_ROOT, ".venv", "bin", "python");
-  if (fs.existsSync(win)) return win;
-  if (fs.existsSync(nix)) return nix;
-  return process.platform === "win32" ? "python" : "python3";
-}
 
 function spawnEnv() {
   const env = { ...process.env };

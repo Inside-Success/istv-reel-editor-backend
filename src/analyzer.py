@@ -1247,7 +1247,11 @@ def _parse_json_object(text: str) -> dict:
     text = re.sub(r"\s*```$", "", text)
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
-        raise ValueError(f"Claude returned no valid JSON.\nResponse preview:\n{text[:500]}")
+        # Log the raw response server-side only — never surface model output in
+        # the exception message, since it propagates verbatim to job["error"]
+        # and gets shown to the user in the desktop app / web frontend.
+        print(f"[analyzer] Claude returned no valid JSON. Response preview:\n{text[:500]}", flush=True)
+        raise ValueError("Claude returned an unparsable response. Please try again.")
     parsed = json.loads(match.group())
     if not isinstance(parsed, dict):
         raise ValueError("Claude JSON root must be an object.")
@@ -1261,10 +1265,12 @@ def _parse_json(text: str, expected_key: str):
     text = re.sub(r"\s*```$", "", text)
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
-        raise ValueError(
-            f"Claude returned no valid JSON for '{expected_key}'.\n"
-            f"Response preview:\n{text[:500]}"
+        print(
+            f"[analyzer] Claude returned no valid JSON for '{expected_key}'. "
+            f"Response preview:\n{text[:500]}",
+            flush=True,
         )
+        raise ValueError(f"Claude returned an unparsable response for '{expected_key}'. Please try again.")
     parsed = json.loads(match.group())
     # Unwrap top-level key if present
     if expected_key in parsed:

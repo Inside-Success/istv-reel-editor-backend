@@ -12,17 +12,9 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const ffmpeg = require("./ffmpeg");
+const { resolvePython, REPO_ROOT } = require("./python");
 
-const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const SYNC_CLI = path.join(REPO_ROOT, "sync_cameras_cli.py");
-
-function resolvePython() {
-  const win = path.join(REPO_ROOT, ".venv", "Scripts", "python.exe");
-  const nix = path.join(REPO_ROOT, ".venv", "bin", "python");
-  if (fs.existsSync(win)) return win;
-  if (fs.existsSync(nix)) return nix;
-  return process.platform === "win32" ? "python" : "python3";
-}
 
 function spawnEnv() {
   const env = { ...process.env };
