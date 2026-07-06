@@ -84,6 +84,17 @@ def load(job_id: str) -> dict | None:
     return {"kind": kind, **data}
 
 
+def load_all() -> list[tuple[str, str, dict]]:
+    """Load every persisted job — used by backend/app.py's startup bootstrap to
+    reload in-memory state and resume in-flight jobs after a restart (the
+    long-running-process model; contrast with `load`, used by the stateless
+    per-request serverless handlers, which only ever need one job at a time)."""
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT job_id, kind, data FROM jobs")
+        rows = cur.fetchall()
+    return [(job_id, kind, data) for job_id, kind, data in rows]
+
+
 def delete(job_id: str) -> None:
     with _connect() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM jobs WHERE job_id = %s", (job_id,))

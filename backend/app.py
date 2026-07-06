@@ -32,7 +32,14 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
-from backend import job_store  # noqa: E402
+from backend import job_store as _sqlite_job_store  # noqa: E402
+from backend import job_store_pg as _pg_job_store  # noqa: E402
+
+# Prefer Postgres when configured — it survives across restarts on hosts with
+# no persistent disk (or, on hosts that do have one, one less thing tied to
+# that specific disk). Falls back to the local SQLite file store, which is
+# what this module was built around, when no database is set up.
+job_store = _pg_job_store if (os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip() else _sqlite_job_store  # noqa: E402
 from src.transcription import poll_transcription_job, transcribe_audio  # noqa: E402
 from src.transcript_cleanup import correct_transcript_words  # noqa: E402
 from src.analyzer import analyze_with_claude, DEFAULT_CLAUDE_MODEL  # noqa: E402
@@ -226,12 +233,15 @@ def _run_selection(
 
 @app.get("/health")
 def health() -> dict:
-    return {
+    out = {
         "ok": True,
         "service": "istv-reel-editor-backend",
         "revai_key": bool((os.getenv("REVAI_API_KEY") or "").strip()),
         "claude_key": bool((os.getenv("CLAUDE_API_KEY") or "").strip()),
     }
+    if job_store is _pg_job_store:
+        out["database"] = _pg_job_store.healthcheck()
+    return out
 
 
 def _start_transcription(body: bytes, fname: str) -> dict:
