@@ -130,7 +130,7 @@ async function uploadAudio(audioPath, { onProgress } = {}) {
   const data = fs.readFileSync(audioPath);
   const total = data.length;
 
-  const { upload_id } = await postJSON("/transcribe/init", {});
+  const { upload_id } = await postJSONWithRetry("/transcribe/init", {});
 
   let sent = 0;
   for (let offset = 0; offset < total; offset += UPLOAD_CHUNK_BYTES) {
@@ -144,7 +144,7 @@ async function uploadAudio(audioPath, { onProgress } = {}) {
     if (onProgress) onProgress(Math.min(1, sent / total));
   }
 
-  return postJSON(`/transcribe/finish/${upload_id}`, { filename });
+  return postJSONWithRetry(`/transcribe/finish/${upload_id}`, { filename });
 }
 
 /** POST JSON to a path, returning the parsed response. */
@@ -179,6 +179,29 @@ function postJSON(pathName, obj, { timeoutMs = 20000 } = {}) {
     req.on("error", reject);
     req.end(data);
   });
+}
+
+// postJSON calls that only *enqueue* work (init an upload, or queue the
+// /select job) are cheap, side-effect-light round trips with nothing like the
+// long Claude call behind pollJob — so a bare ECONNRESET/timeout here is a
+// plain network hiccup, not a sign the server is doing something slow. Unlike
+// pollJob (below), postJSON itself has no retry, so one dropped connection on
+// this initial call surfaced as a raw, unrecoverable "read ECONNRESET" and
+// failed the whole step even though a retry moments later would have worked
+// fine. Retrying a few times here costs nothing (no job exists yet, or the
+// upload_id chunk store hasn't been touched) and matches the resilience the
+// polling loop already has.
+const POST_JSON_MAX_ATTEMPTS = 4;
+
+async function postJSONWithRetry(pathName, obj, opts) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await postJSON(pathName, obj, opts);
+    } catch (err) {
+      if (attempt >= POST_JSON_MAX_ATTEMPTS || !isTransientPollError(err)) throw err;
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
 }
 
 // On the serverless backend, a single GET /jobs/{id} poll can itself run one
@@ -248,7 +271,7 @@ async function pollJob(jobId, { onStatus, intervalMs = 2500, timeoutMs = 30 * 60
 
 /** POST /select then poll → resolves with the analysis (reels + metadata). */
 async function selectReels(transcript, name, numReels, { onStatus } = {}) {
-  const { job_id } = await postJSON("/select", { transcript, name, num_reels: numReels });
+  const { job_id } = await postJSONWithRetry("/select", { transcript, name, num_reels: numReels });
   const final = await pollJob(job_id, { onStatus });
   return final.analysis;
 }
