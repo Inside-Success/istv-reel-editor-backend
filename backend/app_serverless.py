@@ -373,7 +373,16 @@ def job_status(job_id: str) -> dict:
         "error": job.get("error"),
     }
     if job["status"] == "done":
-        if job.get("transcript") is not None:
+        # A "select" job's `transcript` is just an echo of what the client
+        # already sent in its POST /select body (kept around only so
+        # _advance_select has it to work with across polls) — the caller
+        # never reads it back (see desktop/src/main/backend.js's selectReels,
+        # which only uses .analysis). For a long transcript this word-level
+        # blob can be hundreds of KB to multiple MB, so including it made the
+        # one poll that finally returns "done" dramatically bigger than every
+        # preceding ~150-byte status ping — exactly the poll most likely to
+        # get cut off by a flaky connection ("fails at the last moment").
+        if job["kind"] == "transcribe" and job.get("transcript") is not None:
             out["transcript"] = job["transcript"]
         if job.get("analysis") is not None:
             out["analysis"] = job["analysis"]
