@@ -73,13 +73,34 @@ def _is_retryable_claude_error(exc: Exception) -> bool:
     return isinstance(exc, (ValueError, json.JSONDecodeError))
 
 
-# Kept comfortably under both the client's own request timeout and Vercel's
-# maxDuration (see backend/app_serverless.py) so this fires first.
+# Fallback only for callers that hand in a client with no explicit timeout
+# configured (e.g. the long-running Render/desktop path, which can afford to
+# hold the process open much longer). Callers with a real wall-clock budget
+# (backend/app_serverless.py) set client timeout=... themselves, and that's
+# what actually governs the deadline below.
 _STREAM_WALL_CLOCK_CAP_S = 200.0
 
 
-def _stream_final_text(stream, *, deadline_s: float = _STREAM_WALL_CLOCK_CAP_S) -> str:
-    """Consume `stream.text_stream`, enforcing a real total-duration deadline."""
+def _client_deadline_s(client: Anthropic, default: float = _STREAM_WALL_CLOCK_CAP_S) -> float:
+    """Reuse whatever request timeout the caller already configured on `client`.
+
+    Keeps this in lockstep with e.g. backend/app_serverless.py's
+    `_CLAUDE_CALL_TIMEOUT_S` without duplicating that number here.
+    """
+    timeout = getattr(client, "timeout", None)
+    if isinstance(timeout, (int, float)):
+        return float(timeout)
+    read = getattr(timeout, "read", None)
+    return float(read) if isinstance(read, (int, float)) else default
+
+
+def _stream_final_text(stream, *, deadline_s: float) -> str:
+    """Consume `stream.text_stream`, enforcing a real total-duration deadline.
+
+    httpx's own read timeout on a streamed response only bounds the gap
+    between chunks, not the call's total duration (see
+    _StreamDeadlineExceeded) — this is what actually bounds the latter.
+    """
     start = time.monotonic()
     chunks: list[str] = []
     for text in stream.text_stream:
@@ -452,7 +473,7 @@ def select_reels(
         system=system,
         messages=[{"role": "user", "content": segmented_text}],
     ) as stream:
-        full_text = _stream_final_text(stream)
+        full_text = _stream_final_text(stream, deadline_s=_client_deadline_s(client))
 
     text = full_text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -732,7 +753,7 @@ OUTPUT — Return ONLY valid JSON. No markdown. No explanation.
         max_tokens=6000,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
-        full_text = _stream_final_text(stream)
+        full_text = _stream_final_text(stream, deadline_s=_client_deadline_s(client))
     result = _parse_json(full_text, "brand_story")
     # Normalise — the JSON root key may or may not be nested
     if isinstance(result, dict) and "brand_story" in result:
