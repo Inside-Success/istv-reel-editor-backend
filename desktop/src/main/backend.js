@@ -216,7 +216,15 @@ async function postJSONWithRetry(pathName, obj, opts) {
 // each poll request much more slack than getJSON's 15s default — otherwise a
 // slow-but-healthy step reads as "Backend request timed out" and fails the
 // whole selection step for nothing.
-const POLL_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+//
+// Must stay comfortably above backend/app_serverless.py's vercel.json
+// maxDuration (800s) — the reel-selection/brand-story Claude call there is
+// allowed to run right up to that ceiling. If this client-side timeout were
+// shorter, the client would destroy the socket and abort an in-flight,
+// still-succeeding request on its own, recreating the exact "connection
+// killed mid-call" failure this file's retry logic exists to work around,
+// except self-inflicted instead of caused by the platform.
+const POLL_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 
 // A poll tick can legitimately take minutes (the backend runs a synchronous
 // Claude call inside that request), which gives an in-flight TCP connection
@@ -254,7 +262,19 @@ async function pollJob(jobId, { onStatus, intervalMs = 2500, timeoutMs = 30 * 60
       consecutiveErrors = 0;
     } catch (err) {
       consecutiveErrors += 1;
-      if (!isTransientPollError(err) || consecutiveErrors >= POLL_MAX_CONSECUTIVE_ERRORS) throw err;
+      if (!isTransientPollError(err)) throw err;
+      if (consecutiveErrors >= POLL_MAX_CONSECUTIVE_ERRORS) {
+        // Surface something a user can act on instead of a bare Node error
+        // code — "read ECONNRESET" on its own gives no indication this was a
+        // dropped connection during Claude's reel-selection call, nor that
+        // retrying (via the app's "Retry" button, which reuses the cached
+        // transcript — see SELECT_REELS_ONLY in main.js) is the right move.
+        throw new Error(
+          `Lost connection to the server ${consecutiveErrors} times in a row while waiting on Claude ` +
+            `(${err.code || err.message}). This can happen with long/slow reel-selection runs. Try again — ` +
+            `it usually succeeds on retry.`
+        );
+      }
       if (onStatus) {
         onStatus({ status: "active", message: `Connection hiccup (${err.code || err.message}); retrying...` });
       }

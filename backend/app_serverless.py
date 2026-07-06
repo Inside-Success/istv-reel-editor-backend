@@ -234,7 +234,20 @@ def _advance_transcribe(job: dict) -> dict:
 # that ceiling turns a platform-level kill (silent, unrecoverable) into a
 # normal APITimeoutError this code can catch and retry across polls instead
 # of within one request.
-_CLAUDE_CALL_TIMEOUT_S = 240.0
+#
+# 240s against a 300s maxDuration only left ~60s of slack for everything else
+# in the request (cold start, Postgres round-trips, JSON-encoding a
+# hundreds-of-KB transcript/analysis) — for a long documentary, the Claude
+# call alone (up to 12000 output tokens for reel selection) can legitimately
+# run past 240s under normal API latency, let alone under load, so this was
+# still losing the race to Vercel's kill on exactly the runs it was meant to
+# protect. Raised alongside vercel.json's maxDuration (now 800s, up from
+# 300s) so the Claude call gets ~50s of slack behind it instead of ~60s
+# against a much tighter ceiling. NOTE: this assumes the Vercel plan/account
+# actually allows an 800s maxDuration for Python functions — verify the next
+# deploy succeeds (Vercel rejects the config outright at build time if not)
+# and dial both numbers back together if it doesn't.
+_CLAUDE_CALL_TIMEOUT_S = 750.0
 _MAX_STEP_ATTEMPTS = 6
 
 
