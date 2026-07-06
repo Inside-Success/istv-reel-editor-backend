@@ -197,6 +197,7 @@ async def select(request: Request) -> dict:
             "cleaned_words": None,
             "cleanup_index": 0,
             "selection_raw": None,
+            "cleaning_attempts": 0,
             "select_attempts": 0,
             "brand_attempts": 0,
         },
@@ -261,13 +262,29 @@ def _advance_select(job: dict) -> dict:
             # see correct_transcript_words_step), checkpointing progress in
             # cleaned_words/cleanup_index so the next poll picks up where this
             # one left off. `cleaned_words` starts as None on a fresh job.
+            # A capped-timeout client + max_retries=0/raise_on_failure=True
+            # (see selecting_reels/brand_story below for why) makes this a
+            # single bounded attempt per poll instead of transcript_cleanup's
+            # default blocking sleep-based retry loop, which could otherwise
+            # run this one poll well past Vercel's maxDuration and get killed.
             words = job.get("cleaned_words")
             if words is None:
                 words = transcript.get("words") or []
             start = int(job.get("cleanup_index") or 0)
-            updated, next_start, done = correct_transcript_words_step(
-                words, start, model=DEFAULT_CLAUDE_MODEL, api_key=key, speaker_name=name,
-            )
+            client = Anthropic(api_key=key, timeout=_CLAUDE_CALL_TIMEOUT_S)
+            try:
+                updated, next_start, done = correct_transcript_words_step(
+                    words, start, model=DEFAULT_CLAUDE_MODEL, api_key=key, speaker_name=name,
+                    client=client, max_retries=0, raise_on_failure=True,
+                )
+            except Exception as exc:
+                attempts = int(job.get("cleaning_attempts") or 0) + 1
+                job["cleaning_attempts"] = attempts
+                if _is_retryable_claude_error(exc) and attempts < _MAX_STEP_ATTEMPTS:
+                    job.update(message=f"Cleaning transcript… (retry {attempts}/{_MAX_STEP_ATTEMPTS} after {exc})")
+                    return job
+                raise
+            job["cleaning_attempts"] = 0
             job["cleaned_words"] = updated
             job["cleanup_index"] = next_start
             if done:

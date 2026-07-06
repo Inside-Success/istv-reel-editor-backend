@@ -77,15 +77,18 @@ def _fetch_chunk_fixes(
     model: str,
     hint: str,
     progress_cb=None,
+    max_retries: int | None = None,
+    raise_on_failure: bool = False,
 ) -> list[dict]:
     numbered = "\n".join(f"{i}: {out[i].get('word','')}" for i in range(ctx_lo, ctx_hi))
     user = (
         f"{hint}Correct ONLY indices {start}..{end - 1} (surrounding lines are context).\n\n"
         f"{numbered}"
     )
+    retries = _CHUNK_RETRY_ATTEMPTS if max_retries is None else max_retries
     fixes: list[dict] = []
     last_exc: Exception | None = None
-    for retry in range(_CHUNK_RETRY_ATTEMPTS + 1):
+    for retry in range(retries + 1):
         try:
             resp = client.messages.create(
                 model=model,
@@ -102,12 +105,14 @@ def _fetch_chunk_fixes(
                 last_exc = exc
                 break
             last_exc = exc
-            if retry < _CHUNK_RETRY_ATTEMPTS:
+            if retry < retries:
                 delay = min(_CHUNK_RETRY_MAX_DELAY, _CHUNK_RETRY_DELAY * (retry + 1))
                 if progress_cb:
                     progress_cb(f"transcript cleanup chunk {start}-{end}: {exc}; retrying in {delay:.0f}s...")
                 time.sleep(delay)
     if last_exc is not None:
+        if raise_on_failure:
+            raise last_exc
         if progress_cb:
             progress_cb(f"transcript cleanup chunk {start}-{end} skipped: {last_exc}")
         return []
@@ -123,6 +128,8 @@ def correct_transcript_words_step(
     speaker_name: str = "",
     client: Anthropic | None = None,
     progress_cb=None,
+    max_retries: int | None = None,
+    raise_on_failure: bool = False,
 ) -> tuple[list[dict], int, bool]:
     """Correct exactly ONE chunk (CHUNK_TOKENS words) starting at `start`.
 
@@ -132,6 +139,12 @@ def correct_transcript_words_step(
     limit — can make one poll do one chunk and resume from `next_start` on the
     next poll. `words` is expected to already carry any earlier chunks' fixes;
     it's copied and returned so callers can just re-save the result.
+
+    `max_retries`/`raise_on_failure` let a caller with its own hard wall-clock
+    budget (a serverless request) opt out of the default blocking, sleep-based
+    in-process retry loop — e.g. `max_retries=0, raise_on_failure=True` makes
+    this a single bounded attempt whose failure the caller can retry across
+    separate polls instead of within one request.
     """
     out = [dict(w) for w in words]
     n = len(out)
@@ -145,7 +158,10 @@ def correct_transcript_words_step(
     end = min(n, start + CHUNK_TOKENS)
     ctx_lo = max(0, start - CONTEXT_TOKENS)
     ctx_hi = min(n, end + CONTEXT_TOKENS)
-    fixes = _fetch_chunk_fixes(client, out, start, end, ctx_lo, ctx_hi, model, hint, progress_cb)
+    fixes = _fetch_chunk_fixes(
+        client, out, start, end, ctx_lo, ctx_hi, model, hint, progress_cb,
+        max_retries=max_retries, raise_on_failure=raise_on_failure,
+    )
 
     for fix in fixes:
         try:
