@@ -94,20 +94,30 @@ def _client_deadline_s(client: Anthropic, default: float = _STREAM_WALL_CLOCK_CA
     return float(read) if isinstance(read, (int, float)) else default
 
 
-def _stream_final_text(stream, *, deadline_s: float) -> str:
+def _stream_final_text(stream, *, deadline_s: float) -> tuple[str, bool]:
     """Consume `stream.text_stream`, enforcing a real total-duration deadline.
 
     httpx's own read timeout on a streamed response only bounds the gap
     between chunks, not the call's total duration (see
     _StreamDeadlineExceeded) — this is what actually bounds the latter.
+
+    Returns (text, deadline_hit) instead of raising outright: the deadline
+    check runs after every chunk including the one that completes the
+    message, so a call that happens to finish just past the cap must not
+    have its already-complete answer thrown away. Whether that's actually a
+    problem depends on whether `text` parses as a complete response, which
+    only the caller can judge — so we hand back what we have and let it
+    decide.
     """
     start = time.monotonic()
     chunks: list[str] = []
+    deadline_hit = False
     for text in stream.text_stream:
         chunks.append(text)
         if time.monotonic() - start > deadline_s:
-            raise _StreamDeadlineExceeded(f"Claude stream exceeded {deadline_s:.0f}s wall-clock cap")
-    return "".join(chunks)
+            deadline_hit = True
+            break
+    return "".join(chunks), deadline_hit
 
 
 def _call_with_retries(fn, *, attempts: int = 6, base_delay: float = 2.0, max_delay: float = 30.0, progress_cb=None, label: str = "Claude call"):
@@ -467,18 +477,24 @@ def select_reels(
     if _profile_is_v2():
         system += V2_PROMPT_ADDENDUM
 
+    deadline_s = _client_deadline_s(client)
     with client.messages.stream(
         model=model,
         max_tokens=12000,
         system=system,
         messages=[{"role": "user", "content": segmented_text}],
     ) as stream:
-        full_text = _stream_final_text(stream, deadline_s=_client_deadline_s(client))
+        full_text, deadline_hit = _stream_final_text(stream, deadline_s=deadline_s)
 
     text = full_text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-    parsed = _parse_json_object(text)
+    try:
+        parsed = _parse_json_object(text)
+    except (ValueError, json.JSONDecodeError):
+        if deadline_hit:
+            raise _StreamDeadlineExceeded(f"Claude stream exceeded {deadline_s:.0f}s wall-clock cap")
+        raise
     return parsed
 
 
@@ -748,13 +764,19 @@ OUTPUT — Return ONLY valid JSON. No markdown. No explanation.
   }}
 }}"""
 
+    deadline_s = _client_deadline_s(client)
     with client.messages.stream(
         model=model,
         max_tokens=6000,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
-        full_text = _stream_final_text(stream, deadline_s=_client_deadline_s(client))
-    result = _parse_json(full_text, "brand_story")
+        full_text, deadline_hit = _stream_final_text(stream, deadline_s=deadline_s)
+    try:
+        result = _parse_json(full_text, "brand_story")
+    except (ValueError, json.JSONDecodeError):
+        if deadline_hit:
+            raise _StreamDeadlineExceeded(f"Claude stream exceeded {deadline_s:.0f}s wall-clock cap")
+        raise
     # Normalise — the JSON root key may or may not be nested
     if isinstance(result, dict) and "brand_story" in result:
         return result["brand_story"]
