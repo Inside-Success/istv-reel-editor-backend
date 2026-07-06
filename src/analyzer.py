@@ -48,12 +48,45 @@ MAX_REEL_DURATION = MAX_REEL_SECONDS
 _RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
 
 
+class _StreamDeadlineExceeded(TimeoutError):
+    """A streamed Claude call ran past our own wall-clock cap.
+
+    httpx's read timeout on a *streamed* response only bounds the gap between
+    individual chunks, not the call's total duration — a steady trickle of
+    SSE events (large transcript, big max_tokens) can keep each gap well
+    under the client's configured timeout while the call as a whole runs
+    right past Vercel's hard maxDuration, which then kills the connection
+    outright (a bare ECONNRESET the caller can't catch or retry). Watching
+    wall-clock time ourselves turns that into a normal exception this code
+    can catch and retry across polls instead, well before the platform pulls
+    the plug.
+    """
+
+
 def _is_retryable_claude_error(exc: Exception) -> bool:
+    if isinstance(exc, _StreamDeadlineExceeded):
+        return True
     if isinstance(exc, anthropic.APIStatusError):
         return exc.status_code in _RETRYABLE_STATUS_CODES
     if isinstance(exc, anthropic.APIConnectionError):  # covers APITimeoutError too (subclass)
         return True
     return isinstance(exc, (ValueError, json.JSONDecodeError))
+
+
+# Kept comfortably under both the client's own request timeout and Vercel's
+# maxDuration (see backend/app_serverless.py) so this fires first.
+_STREAM_WALL_CLOCK_CAP_S = 200.0
+
+
+def _stream_final_text(stream, *, deadline_s: float = _STREAM_WALL_CLOCK_CAP_S) -> str:
+    """Consume `stream.text_stream`, enforcing a real total-duration deadline."""
+    start = time.monotonic()
+    chunks: list[str] = []
+    for text in stream.text_stream:
+        chunks.append(text)
+        if time.monotonic() - start > deadline_s:
+            raise _StreamDeadlineExceeded(f"Claude stream exceeded {deadline_s:.0f}s wall-clock cap")
+    return "".join(chunks)
 
 
 def _call_with_retries(fn, *, attempts: int = 6, base_delay: float = 2.0, max_delay: float = 30.0, progress_cb=None, label: str = "Claude call"):
@@ -419,7 +452,7 @@ def select_reels(
         system=system,
         messages=[{"role": "user", "content": segmented_text}],
     ) as stream:
-        full_text = stream.get_final_text()
+        full_text = _stream_final_text(stream)
 
     text = full_text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -699,7 +732,7 @@ OUTPUT — Return ONLY valid JSON. No markdown. No explanation.
         max_tokens=6000,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
-        full_text = stream.get_final_text()
+        full_text = _stream_final_text(stream)
     result = _parse_json(full_text, "brand_story")
     # Normalise — the JSON root key may or may not be nested
     if isinstance(result, dict) and "brand_story" in result:
