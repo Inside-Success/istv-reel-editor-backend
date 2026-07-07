@@ -28,7 +28,6 @@
       "src/**/*",
       "package.json"
     ],
-    "//asarUnpack": "The ffmpeg/ffprobe binaries can't be exec'd from inside app.asar; ffmpeg.js rewrites their path to app.asar.unpacked, so they MUST be unpacked here. Export renders entirely in-process via the bundled Node engine (src/main/mediaEngine.cjs) — no Python is spawned, so nothing outside desktop/ needs to be packaged.",
     "asarUnpack": [
       "node_modules/ffmpeg-static/**",
       "node_modules/ffprobe-static/**"
