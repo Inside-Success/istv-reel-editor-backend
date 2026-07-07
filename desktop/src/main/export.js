@@ -1,24 +1,23 @@
 "use strict";
 
 /**
- * Export orchestrator. Renders edited reels from the FULL-RES master by spawning
- * the repo's `export_cli.py`, which reuses the proven caption builder + Node/
- * FFmpeg engine (`media.cjs`). We reuse rather than re-implement so exported
- * reels match the tool's approved karaoke/reframe output exactly.
+ * Export orchestrator. Renders edited reels from the FULL-RES master entirely in
+ * Node — no Python. Each reel's caption/karaoke payload is built by captions.cjs
+ * (a port of the repo's proven caption builder) and rendered by mediaEngine.cjs
+ * (the bundled Node/FFmpeg engine driving the app's ffmpeg-static binaries), so
+ * exported reels match the tool's approved karaoke/reframe output.
  *
- * The bundled ffmpeg/ffprobe directories are prepended to PATH for the spawned
- * process so the engine's `ffmpeg`/`ffprobe` calls resolve even without a system
- * install. All paths are passed as argv / JSON — never shell-concatenated.
+ * This used to spawn the repo's `export_cli.py` via a local Python `.venv`,
+ * which does not exist on an end user's machine — so export failed in a packaged
+ * build with "Is Python available?". Running the render in-process removes that
+ * dependency: everything it needs is bundled inside the app.
  */
 
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawn } = require("child_process");
-const ffmpeg = require("./ffmpeg");
-const { resolvePython, REPO_ROOT } = require("./python");
-
-const EXPORT_CLI = path.join(REPO_ROOT, "export_cli.py");
+const { buildExportPayload } = require("./captions.cjs");
+const engine = require("./mediaEngine.cjs");
 
 const RESOLUTIONS = {
   "720p": { width: 720, height: 1280 },
@@ -26,28 +25,17 @@ const RESOLUTIONS = {
   "2K": { width: 1440, height: 2560 },
   "4K": { width: 2160, height: 3840 },
   // Sentinel: export at the source's native resolution (crop only, no scale)
-  // instead of a fixed pixel target — see media.cjs exportReel.
+  // instead of a fixed pixel target — see mediaEngine.cjs exportReel.
   Original: { width: "original", height: "original" },
 };
 const QUALITY = { Lower: "low", Recommended: "medium", Higher: "high" };
 // Faster x264 presets for snappier desktop exports (CRF still governs quality).
 const PRESET = { Lower: "veryfast", Recommended: "faster", Higher: "medium" };
 
-function spawnEnv() {
-  const env = { ...process.env };
-  delete env.ELECTRON_RUN_AS_NODE;
-  const extra = [path.dirname(ffmpeg.ffmpegPath()), path.dirname(ffmpeg.ffprobePath())];
-  env.PATH = extra.join(path.delimiter) + path.delimiter + (env.PATH || "");
-  return env;
-}
-
 /** Convert an app reel (in/out references + settings) into the CLI's reel spec. */
 function toExportReel(reel) {
   // Multi-camera (optional): reel.settings.camera picks which camera this
-  // WHOLE reel pulls footage from — applied uniformly to every segment. The
-  // editor doesn't yet expose per-segment (per-cut) camera switching, but the
-  // export/media.cjs layer already supports it per-segment; a future editor UI
-  // could set `camera` per-span without any pipeline changes.
+  // WHOLE reel pulls footage from — applied uniformly to every segment.
   const reelCamera = reel.settings.camera || null;
   const editorCutSheet = reel.segments.map((s, idx) => ({
     order: idx + 1,
@@ -73,12 +61,8 @@ function toExportReel(reel) {
     editor_cut_sheet: editorCutSheet,
     timestamped_words: words,
     options: {
-      // "Remove fillers" only hides filler words from the burned-in captions
-      // (always on server-side, see media.cjs hideFillersInSubtitles) and from
-      // the transcript editor preview (model.js) — it no longer cuts them out
-      // of the video, since word-level cuts risked exploding the ffmpeg command
-      // line on filler-heavy reels. reel.settings.removeFillers still drives the
-      // editor preview; there's nothing left for it to control at export time.
+      // "Remove fillers" only hides filler words from the burned-in captions and
+      // the transcript editor preview; it no longer cuts them out of the video.
       cutSilences: !!reel.settings.removeSilences,
       canvas: {
         cropX: rf.cropX != null ? rf.cropX : 0.5,
@@ -92,95 +76,112 @@ function toExportReel(reel) {
   };
 }
 
+/** Filesystem-safe output basename for a reel (matches export_cli.py). */
+function safeName(reelId, title) {
+  const safe = String(title || `reel_${reelId}`)
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .slice(0, 48)
+    .replace(/^_+|_+$/g, "");
+  const idStr = String(reelId).padStart(2, "0");
+  return `reel_${idStr}_${safe || "reel"}_916`;
+}
+
+/** Bound concurrent reel exports — min(4, cpuCount, jobCount), REEL_MAX_WORKERS overrides. */
+function resolveMaxWorkers(jobCount) {
+  const override = Number(process.env.REEL_MAX_WORKERS);
+  if (Number.isInteger(override) && override > 0) return Math.max(1, Math.min(override, jobCount));
+  const cores = (os.cpus() || []).length || 4;
+  return Math.max(1, Math.min(4, cores, jobCount));
+}
+
+/** Run `tasks` with at most `limit` in flight at once. */
+async function runPool(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function drain() {
+    while (cursor < items.length) {
+      const i = cursor;
+      cursor += 1;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, drain));
+  return results;
+}
+
 /**
- * Build the spec, spawn the exporter, stream progress events.
+ * Build each reel's payload and render it via the bundled Node/FFmpeg engine,
+ * streaming progress events. Reels render concurrently (bounded pool).
  * @returns {Promise<string[]>} exported file paths
  */
-function exportReels({ srcPath, outDir, reels, dialog, cameras, onEvent }) {
-  return new Promise((resolve, reject) => {
-    const losslessAudio = !!dialog.losslessAudio;
-    // Raw PCM audio has poor compatibility inside an MP4 container — MOV (QuickTime)
-    // supports it properly, so force the container when lossless audio is requested.
-    const format = losslessAudio ? "mov" : dialog.format || "mp4";
-    const options = {
-      resolution: RESOLUTIONS[dialog.resolution] || RESOLUTIONS["1080p"],
-      fps: dialog.fps || "source",
-      quality: QUALITY[dialog.quality] || "medium",
-      encodePreset: PRESET[dialog.quality] || "faster",
-      losslessAudio,
-    };
-    // Multi-camera (optional): {camera_id: {path, offsetSec}} — omitted entirely
-    // for ordinary single-camera projects, which export exactly as before.
-    if (cameras && cameras.length) {
-      options.sources = Object.fromEntries(
-        cameras.map((c) => [c.id, { path: c.path, offsetSec: Number(c.offsetSec) || 0 }]),
-      );
-    }
-    const spec = {
-      source: srcPath,
-      outDir,
-      format,
-      options,
-      reels: reels.map(toExportReel),
-    };
+async function exportReels({ srcPath, outDir, reels, dialog, cameras, onEvent }) {
+  const losslessAudio = !!dialog.losslessAudio;
+  // Raw PCM audio has poor compatibility inside an MP4 container — MOV (QuickTime)
+  // supports it properly, so force the container when lossless audio is requested.
+  const format = losslessAudio ? "mov" : dialog.format || "mp4";
+  const ext = String(format).toLowerCase() === "mov" ? "mov" : "mp4";
 
-    const specPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "istv-export-")), "spec.json");
-    fs.writeFileSync(specPath, JSON.stringify(spec), "utf8");
+  const globalOptions = {
+    resolution: RESOLUTIONS[dialog.resolution] || RESOLUTIONS["1080p"],
+    fps: dialog.fps || "source",
+    quality: QUALITY[dialog.quality] || "medium",
+    encodePreset: PRESET[dialog.quality] || "faster",
+    losslessAudio,
+  };
+  // Multi-camera (optional): {camera_id: {path, offsetSec}} — omitted entirely
+  // for ordinary single-camera projects, which export exactly as before.
+  if (cameras && cameras.length) {
+    globalOptions.sources = Object.fromEntries(
+      cameras.map((c) => [c.id, { path: c.path, offsetSec: Number(c.offsetSec) || 0 }]),
+    );
+  }
 
-    const outputs = [];
-    let stderr = "";
-    const py = resolvePython();
-    console.log(`[export] spawning: ${py} ${EXPORT_CLI} (${spec.reels.length} reel(s) -> ${outDir})`);
-    const child = spawn(py, [EXPORT_CLI, specPath], {
-      cwd: REPO_ROOT,
-      env: spawnEnv(),
-      windowsHide: true,
-    });
+  if (!fs.existsSync(srcPath)) throw new Error(`Master not found: ${srcPath}`);
+  fs.mkdirSync(outDir, { recursive: true });
 
-    let buf = "";
-    child.stdout.on("data", (d) => {
-      buf += d.toString();
-      const lines = buf.split(/\r?\n/);
-      buf = lines.pop();
-      for (const line of lines) handleLine(line.trim());
-    });
-    child.stderr.on("data", (d) => (stderr += d.toString()));
+  const specs = reels.map(toExportReel);
+  const total = specs.length;
+  const outputs = new Array(total).fill(null);
+  const errors = [];
 
-    function handleLine(line) {
-      if (!line) return;
-      const parts = line.split(" ");
-      const tag = parts[0];
-      if (tag === "PROGRESS") {
-        onEvent({
-          status: "exporting",
-          index: Number(parts[1]),
-          total: Number(parts[2]),
-          message: parts.slice(4).join(" "),
-        });
-      } else if (tag === "REEL_DONE") {
-        outputs.push(parts.slice(2).join(" "));
-        onEvent({ status: "reel-done", index: Number(parts[1]) });
-      } else if (tag === "ERROR") {
-        onEvent({ status: "error", message: parts.slice(1).join(" ") });
+  console.log(`[export] rendering ${total} reel(s) -> ${outDir} (Node engine, no Python)`);
+
+  await runPool(specs, resolveMaxWorkers(total), async (reelSpec, i) => {
+    const index = i + 1;
+    const title = reelSpec.title || `reel_${reelSpec.id ?? index}`;
+    onEvent({ status: "exporting", index, total, message: title });
+
+    // Per-reel options override the dialog-wide globals (matches the Python
+    // {**global, **reel.options} merge).
+    const mergedOptions = { ...globalOptions, ...(reelSpec.options || {}) };
+    const outPath = path.join(outDir, `${safeName(reelSpec.id ?? index, title)}.${ext}`);
+
+    try {
+      const payload = buildExportPayload(reelSpec, mergedOptions);
+      await engine.exportReel(srcPath, outPath, payload);
+      if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 20000) {
+        throw new Error(`Export too small or missing: ${path.basename(outPath)}`);
       }
+      outputs[i] = outPath;
+      onEvent({ status: "reel-done", index });
+      console.log(`[export] [${index}/${total}] OK ${path.basename(outPath)}`);
+    } catch (err) {
+      const message = `reel ${index} (${title}): ${err.message}`;
+      errors.push(message);
+      onEvent({ status: "error", message });
+      console.error(`[export] ${message}`);
     }
-
-    child.on("error", (err) => {
-      console.error(`[export] spawn error: ${err.message}`);
-      try { fs.rmSync(path.dirname(specPath), { recursive: true, force: true }); } catch (_e) {}
-      reject(new Error(`Could not start exporter (${err.message}). Is Python available?`));
-    });
-    child.on("close", (code) => {
-      try { fs.rmSync(path.dirname(specPath), { recursive: true, force: true }); } catch (_e) {}
-      if (code === 0) {
-        console.log(`[export] done: ${outputs.length} file(s)`);
-        resolve(outputs);
-      } else {
-        console.error(`[export] exited ${code}: ${stderr.trim().slice(-800)}`);
-        reject(new Error(stderr.trim().slice(-400) || `Exporter exited ${code}`));
-      }
-    });
   });
+
+  const done = outputs.filter(Boolean);
+  // If every reel failed, surface a hard error so the UI shows "Export failed"
+  // rather than a misleading "Done — 0 files". A partial success still returns
+  // the reels that did render (the UI reports the count).
+  if (!done.length) {
+    throw new Error(errors.join("; ") || "Export produced no files");
+  }
+  console.log(`[export] done: ${done.length}/${total} file(s)`);
+  return done;
 }
 
 module.exports = { exportReels, RESOLUTIONS, QUALITY };
