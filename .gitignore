@@ -28,5 +28,6 @@ backend/jobs.db
 .env*
 
 #Desktop app
-desktop/
-desktop
+desktop/dist
+desktop/node_modules
+desktop/package-lock.json
