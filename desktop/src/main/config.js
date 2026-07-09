@@ -7,7 +7,7 @@ const { app } = require("electron");
 // local dev, since that's almost always a developer iterating against a
 // backend they're running themselves. Either way, ISTV_BACKEND_URL overrides.
 const DEFAULT_BACKEND_URL = app.isPackaged
-  ? "https://istv-reel-editor-backend.onrender.com"
+  ? "https://istv-reel-editor-backend-2b8q.onrender.com"
   : "http://127.0.0.1:8722";
 
 const BACKEND_URL = (process.env.ISTV_BACKEND_URL || DEFAULT_BACKEND_URL).replace(/\/$/, "");
