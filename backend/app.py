@@ -40,6 +40,16 @@ from backend import job_store_pg as _pg_job_store  # noqa: E402
 # that specific disk). Falls back to the local SQLite file store, which is
 # what this module was built around, when no database is set up.
 job_store = _pg_job_store if (os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip() else _sqlite_job_store  # noqa: E402
+
+# Chunked uploads (see /transcribe/init|chunk|finish) buffer in the process's
+# _UPLOADS dict by default, which only works when a *single* process serves
+# every chunk of a given upload — behind a load balancer, across a redeploy, or
+# after a spin-down, chunks for one upload_id get spread over processes that
+# never saw its /init and return 404 (the "some chunks 200, some 404, finish
+# 404" failure). When Postgres backs the store we persist chunks there instead,
+# so any process can assemble the upload. Local SQLite has no chunk table, so it
+# stays on the in-memory path (fine for a single-process dev/instance).
+_CHUNKS_IN_DB = hasattr(job_store, "save_chunk")  # noqa: E402
 from src.transcription import poll_transcription_job, transcribe_audio  # noqa: E402
 from src.transcript_cleanup import correct_transcript_words  # noqa: E402
 from src.analyzer import analyze_with_claude, DEFAULT_CLAUDE_MODEL  # noqa: E402
@@ -287,8 +297,13 @@ async def transcribe(request: Request) -> dict:
 @app.post("/transcribe/init")
 async def transcribe_init() -> dict:
     upload_id = uuid.uuid4().hex[:12]
-    with _UPLOAD_LOCK:
-        _UPLOADS[upload_id] = {}
+    # With Postgres, chunks are keyed by upload_id on write (upsert) — no buffer
+    # to pre-create, and nothing that a different process would need to have seen
+    # first. The in-memory path still seeds an empty dict so /chunk can tell a
+    # known upload from a stale one.
+    if not _CHUNKS_IN_DB:
+        with _UPLOAD_LOCK:
+            _UPLOADS[upload_id] = {}
     return {"upload_id": upload_id}
 
 
@@ -298,6 +313,10 @@ async def transcribe_chunk(upload_id: str, request: Request) -> dict:
     if idx_header is None:
         raise HTTPException(status_code=400, detail="Missing X-Chunk-Index header")
     body = await request.body()
+    if _CHUNKS_IN_DB:
+        # Any process can persist this chunk; /finish reads them all back.
+        job_store.save_chunk(upload_id, int(idx_header), body)
+        return {"ok": True}
     with _UPLOAD_LOCK:
         chunks = _UPLOADS.get(upload_id)
         if chunks is None:
@@ -310,6 +329,12 @@ async def transcribe_chunk(upload_id: str, request: Request) -> dict:
 async def transcribe_finish(upload_id: str, request: Request) -> dict:
     payload = await request.json()
     fname = str(payload.get("filename") or "audio.mp3")
+    if _CHUNKS_IN_DB:
+        body = job_store.load_chunks(upload_id)
+        job_store.delete_chunks(upload_id)
+        if not body:
+            raise HTTPException(status_code=404, detail="No chunks found for upload_id")
+        return _start_transcription(body, fname)
     with _UPLOAD_LOCK:
         chunks = _UPLOADS.pop(upload_id, None)
     if chunks is None:
@@ -430,4 +455,11 @@ def _bootstrap_jobs() -> None:
                 ).start()
 
 
-_bootstrap_jobs()
+try:
+    _bootstrap_jobs()
+except Exception as exc:  # noqa: BLE001
+    # Resuming old jobs is best-effort — a transient DB hiccup at boot must not
+    # crash-loop the whole service and take down new requests with it. The store
+    # (re)creates its schema lazily on the next call, so live traffic recovers on
+    # its own once the DB is reachable.
+    print(f"[startup] job bootstrap skipped: {exc}", file=sys.stderr)
