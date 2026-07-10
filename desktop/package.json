@@ -35,6 +35,11 @@
     "directories": {
       "output": "dist"
     },
+    "publish": {
+      "provider": "github",
+      "owner": "Inside-Success",
+      "repo": "istv-reel-editor-backend"
+    },
     "win": {
       "target": "nsis"
     },
