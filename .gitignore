@@ -30,4 +30,3 @@ backend/jobs.db
 #Desktop app
 desktop/dist
 desktop/node_modules
-desktop/package-lock.json

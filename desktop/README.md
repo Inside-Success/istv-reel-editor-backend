@@ -19,6 +19,30 @@ the next begins.
 - **Proxy:** on import, a low-res keyframe-dense proxy is generated for smooth
   scrubbing; editing happens against the proxy, export against the master.
 
+## Getting started (clone & run)
+
+Requires **Node.js 20+** and **git**. Works on macOS and Windows.
+
+```bash
+git clone https://github.com/Inside-Success/istv-reel-editor-backend.git
+cd istv-reel-editor-backend/desktop
+npm install
+npm start
+```
+
+To build a distributable installer for the OS you're on:
+
+```bash
+npm run dist   # macOS -> .dmg, Windows -> .exe (NSIS), written to desktop/dist/
+```
+
+> A macOS `.dmg` can only be built on a Mac and a Windows `.exe` only on Windows —
+> electron-builder does not cross-build these.
+
+> **Export needs more than Node.** Opening, editing and previewing reels runs on
+> Node alone. The full **Generate Reels → Export** pipeline additionally spawns the
+> repo's Python `.venv` and talks to the backend (see `../backend`).
+
 ## Run
 
 ```bash
