@@ -32,7 +32,25 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
-from backend import job_store  # noqa: E402
+from backend import job_store as _sqlite_job_store  # noqa: E402
+from backend import job_store_pg as _pg_job_store  # noqa: E402
+
+# Prefer Postgres when configured — it survives across restarts on hosts with
+# no persistent disk (or, on hosts that do have one, one less thing tied to
+# that specific disk). Falls back to the local SQLite file store, which is
+# what this module was built around, when no database is set up.
+job_store = _pg_job_store if (os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip() else _sqlite_job_store  # noqa: E402
+
+# Postgres is a *shared* store: any process can read/write it, and it survives
+# restarts. The in-memory _JOBS/_UPLOADS dicts below are per-process, so they
+# only work when a single process serves every request for a given job/upload.
+# That assumption breaks across a redeploy (Render does a rolling cutover where
+# the old and new instance both serve traffic briefly) or any restart: a job or
+# upload created on one process is invisible to another, which then 404s. When a
+# shared store is configured we treat *it* as the source of truth for both job
+# status reads and chunked uploads; local SQLite (single-process dev) keeps the
+# fast in-memory path.
+_SHARED_STORE = hasattr(job_store, "save_chunk")  # noqa: E402
 from src.transcription import poll_transcription_job, transcribe_audio  # noqa: E402
 from src.transcript_cleanup import correct_transcript_words  # noqa: E402
 from src.analyzer import analyze_with_claude, DEFAULT_CLAUDE_MODEL  # noqa: E402
@@ -60,6 +78,13 @@ app.add_middleware(
 # process — SQLite is plenty for a single instance.
 _JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
+
+# Buffers chunked audio uploads (see /transcribe/init|chunk|finish). Not
+# persisted through job_store since a chunk set is only needed transiently
+# until /finish assembles it — a restart mid-upload just means the client
+# retries, same as any other dropped connection.
+_UPLOADS: dict[str, dict[int, bytes]] = {}
+_UPLOAD_LOCK = threading.Lock()
 
 
 def _set(job_id: str, **fields) -> None:
@@ -219,24 +244,18 @@ def _run_selection(
 
 @app.get("/health")
 def health() -> dict:
-    return {
+    out = {
         "ok": True,
         "service": "istv-reel-editor-backend",
         "revai_key": bool((os.getenv("REVAI_API_KEY") or "").strip()),
         "claude_key": bool((os.getenv("CLAUDE_API_KEY") or "").strip()),
     }
+    if job_store is _pg_job_store:
+        out["database"] = _pg_job_store.healthcheck()
+    return out
 
 
-@app.post("/transcribe")
-async def transcribe(request: Request) -> dict:
-    """Accept a compressed audio file (raw octet-stream) and start a Rev.ai job.
-
-    The filename is passed via the ``X-Filename`` header so we keep the right
-    extension; the body is the raw bytes (no multipart needed → trivial upload
-    progress on the client).
-    """
-    fname = request.headers.get("x-filename", "audio.mp3")
-    body = await request.body()
+def _start_transcription(body: bytes, fname: str) -> dict:
     if not body:
         raise HTTPException(status_code=400, detail="Empty request body")
 
@@ -259,6 +278,70 @@ async def transcribe(request: Request) -> dict:
     )
     threading.Thread(target=_run_transcription, args=(job_id, path), daemon=True).start()
     return {"job_id": job_id, "bytes": len(body)}
+
+
+@app.post("/transcribe")
+async def transcribe(request: Request) -> dict:
+    """Accept a compressed audio file (raw octet-stream) and start a Rev.ai job.
+
+    The filename is passed via the ``X-Filename`` header so we keep the right
+    extension; the body is the raw bytes (no multipart needed → trivial upload
+    progress on the client). Same API surface as backend/app_serverless.py's
+    chunked endpoints below — the desktop client always uses those instead so
+    it doesn't need to know which host it's talking to.
+    """
+    fname = request.headers.get("x-filename", "audio.mp3")
+    body = await request.body()
+    return _start_transcription(body, fname)
+
+
+@app.post("/transcribe/init")
+async def transcribe_init() -> dict:
+    upload_id = uuid.uuid4().hex[:12]
+    # With Postgres, chunks are keyed by upload_id on write (upsert) — no buffer
+    # to pre-create, and nothing that a different process would need to have seen
+    # first. The in-memory path still seeds an empty dict so /chunk can tell a
+    # known upload from a stale one.
+    if not _SHARED_STORE:
+        with _UPLOAD_LOCK:
+            _UPLOADS[upload_id] = {}
+    return {"upload_id": upload_id}
+
+
+@app.post("/transcribe/chunk/{upload_id}")
+async def transcribe_chunk(upload_id: str, request: Request) -> dict:
+    idx_header = request.headers.get("x-chunk-index")
+    if idx_header is None:
+        raise HTTPException(status_code=400, detail="Missing X-Chunk-Index header")
+    body = await request.body()
+    if _SHARED_STORE:
+        # Any process can persist this chunk; /finish reads them all back.
+        job_store.save_chunk(upload_id, int(idx_header), body)
+        return {"ok": True}
+    with _UPLOAD_LOCK:
+        chunks = _UPLOADS.get(upload_id)
+        if chunks is None:
+            raise HTTPException(status_code=404, detail="Unknown upload_id (server may have restarted)")
+        chunks[int(idx_header)] = body
+    return {"ok": True}
+
+
+@app.post("/transcribe/finish/{upload_id}")
+async def transcribe_finish(upload_id: str, request: Request) -> dict:
+    payload = await request.json()
+    fname = str(payload.get("filename") or "audio.mp3")
+    if _SHARED_STORE:
+        body = job_store.load_chunks(upload_id)
+        job_store.delete_chunks(upload_id)
+        if not body:
+            raise HTTPException(status_code=404, detail="No chunks found for upload_id")
+        return _start_transcription(body, fname)
+    with _UPLOAD_LOCK:
+        chunks = _UPLOADS.pop(upload_id, None)
+    if chunks is None:
+        raise HTTPException(status_code=404, detail="Unknown upload_id (server may have restarted)")
+    body = b"".join(chunks[i] for i in sorted(chunks))
+    return _start_transcription(body, fname)
 
 
 @app.post("/select")
@@ -307,22 +390,31 @@ async def select(request: Request) -> dict:
 
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
-    with _LOCK:
-        job = _JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        out = {
-            "status": job["status"],
-            "message": job["message"],
-            "elapsed": job.get("elapsed", 0),
-            "error": job["error"],
-        }
-        if job["status"] == "done":
-            if job.get("transcript") is not None:
-                out["transcript"] = job["transcript"]
-            if job.get("analysis") is not None:
-                out["analysis"] = job["analysis"]
-        return out
+    # With a shared store, read status straight from it rather than this
+    # process's _JOBS dict. The worker thread that owns the job writes every
+    # update through to the store (see _set), so the store is always current —
+    # and it's the only copy a *different* process (e.g. the new instance during
+    # a rolling redeploy) can see. Reading _JOBS here is what made polls 404
+    # when they landed on a process that never created the job.
+    if _SHARED_STORE:
+        job = job_store.load(job_id)
+    else:
+        with _LOCK:
+            job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    out = {
+        "status": job["status"],
+        "message": job.get("message"),
+        "elapsed": job.get("elapsed", 0),
+        "error": job.get("error"),
+    }
+    if job["status"] == "done":
+        if job.get("transcript") is not None:
+            out["transcript"] = job["transcript"]
+        if job.get("analysis") is not None:
+            out["analysis"] = job["analysis"]
+    return out
 
 
 # ── Startup: reload persisted jobs and resume in-flight ones ────────────────
@@ -373,4 +465,11 @@ def _bootstrap_jobs() -> None:
                 ).start()
 
 
-_bootstrap_jobs()
+try:
+    _bootstrap_jobs()
+except Exception as exc:  # noqa: BLE001
+    # Resuming old jobs is best-effort — a transient DB hiccup at boot must not
+    # crash-loop the whole service and take down new requests with it. The store
+    # (re)creates its schema lazily on the next call, so live traffic recovers on
+    # its own once the DB is reachable.
+    print(f"[startup] job bootstrap skipped: {exc}", file=sys.stderr)

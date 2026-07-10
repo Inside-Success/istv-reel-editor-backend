@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: istv-reel-editor-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: REVAI_API_KEY
+        sync: false
+      - key: CLAUDE_API_KEY
+        sync: false
+      # Enables the Postgres-backed job + chunked-upload store so uploads survive
+      # a restart/redeploy and work even if more than one process serves traffic
+      # (otherwise chunked uploads 404 intermittently — see app.py _CHUNKS_IN_DB).
+      # Set the value (the Render Postgres Internal Database URL) in the dashboard.
+      - key: DATABASE_URL
+        sync: false

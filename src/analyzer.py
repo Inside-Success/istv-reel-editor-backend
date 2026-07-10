@@ -62,12 +62,76 @@ _RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
 _CLAUDE_CLIENT_TIMEOUT_SECONDS = 600.0
 
 
+class _StreamDeadlineExceeded(TimeoutError):
+    """A streamed Claude call ran past our own wall-clock cap.
+
+    httpx's read timeout on a *streamed* response only bounds the gap between
+    individual chunks, not the call's total duration — a steady trickle of
+    SSE events (large transcript, big max_tokens) can keep each gap well
+    under the client's configured timeout while the call as a whole runs
+    right past Vercel's hard maxDuration, which then kills the connection
+    outright (a bare ECONNRESET the caller can't catch or retry). Watching
+    wall-clock time ourselves turns that into a normal exception this code
+    can catch and retry across polls instead, well before the platform pulls
+    the plug.
+    """
+
+
 def _is_retryable_claude_error(exc: Exception) -> bool:
+    if isinstance(exc, _StreamDeadlineExceeded):
+        return True
     if isinstance(exc, anthropic.APIStatusError):
         return exc.status_code in _RETRYABLE_STATUS_CODES
     if isinstance(exc, anthropic.APIConnectionError):  # covers APITimeoutError too (subclass)
         return True
     return isinstance(exc, (ValueError, json.JSONDecodeError))
+
+
+# Fallback only for callers that hand in a client with no explicit timeout
+# configured (e.g. the long-running Render/desktop path, which can afford to
+# hold the process open much longer). Callers with a real wall-clock budget
+# (backend/app_serverless.py) set client timeout=... themselves, and that's
+# what actually governs the deadline below.
+_STREAM_WALL_CLOCK_CAP_S = 200.0
+
+
+def _client_deadline_s(client: Anthropic, default: float = _STREAM_WALL_CLOCK_CAP_S) -> float:
+    """Reuse whatever request timeout the caller already configured on `client`.
+
+    Keeps this in lockstep with e.g. backend/app_serverless.py's
+    `_CLAUDE_CALL_TIMEOUT_S` without duplicating that number here.
+    """
+    timeout = getattr(client, "timeout", None)
+    if isinstance(timeout, (int, float)):
+        return float(timeout)
+    read = getattr(timeout, "read", None)
+    return float(read) if isinstance(read, (int, float)) else default
+
+
+def _stream_final_text(stream, *, deadline_s: float) -> tuple[str, bool]:
+    """Consume `stream.text_stream`, enforcing a real total-duration deadline.
+
+    httpx's own read timeout on a streamed response only bounds the gap
+    between chunks, not the call's total duration (see
+    _StreamDeadlineExceeded) — this is what actually bounds the latter.
+
+    Returns (text, deadline_hit) instead of raising outright: the deadline
+    check runs after every chunk including the one that completes the
+    message, so a call that happens to finish just past the cap must not
+    have its already-complete answer thrown away. Whether that's actually a
+    problem depends on whether `text` parses as a complete response, which
+    only the caller can judge — so we hand back what we have and let it
+    decide.
+    """
+    start = time.monotonic()
+    chunks: list[str] = []
+    deadline_hit = False
+    for text in stream.text_stream:
+        chunks.append(text)
+        if time.monotonic() - start > deadline_s:
+            deadline_hit = True
+            break
+    return "".join(chunks), deadline_hit
 
 
 def _call_with_retries(fn, *, attempts: int = 6, base_delay: float = 2.0, max_delay: float = 30.0, progress_cb=None, label: str = "Claude call"):
@@ -282,6 +346,71 @@ def _length_rule() -> str:
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
+def prepare_segments(transcript: dict, words: list[dict] | None = None):
+    """Pure-Python prep (no Claude calls): normalize word timings, build
+    sentence segments, and format them for the Claude prompt.
+
+    Split out of analyze_with_claude so it can be called more than once (e.g.
+    once per resumable serverless step, since it's cheap) without repeating
+    any of the LLM work. Returns (normalized_words, segments, segmented_text,
+    duration_str).
+    """
+    raw_words = words if words is not None else (transcript.get("words") or [])
+    norm_words = normalize_word_timings(raw_words)
+    segments = build_sentence_segments(norm_words, float(transcript.get("duration") or 0))
+    segmented_text = format_segments_for_claude(segments)
+    duration_str = fmt_time(transcript.get("duration") or 0)
+    return norm_words, segments, segmented_text, duration_str
+
+
+def finalize_analysis(
+    reels_raw: list,
+    documentary_summary: str,
+    recommendations: dict,
+    brand: dict,
+    words: list[dict],
+    segments: list[dict],
+    duration_seconds: float,
+    *,
+    num_reels: int = DEFAULT_NUM_REELS,
+    story_mode: bool = False,
+    main_speaker_id: int | None = None,
+) -> dict:
+    """Turn raw Claude output (reel selection + brand story) into the final
+    analysis dict. Pure Python, no further LLM calls — split out of
+    analyze_with_claude so a caller that ran the two Claude calls as separate
+    bounded steps (see backend/app_serverless.py) can finalize once both are
+    in hand, same as the single-shot path below does inline.
+    """
+    reels = [_normalize_claude_reel(row, idx + 1) for idx, row in enumerate(reels_raw)]
+    reels.sort(key=lambda r: int(r.get("rank") or r.get("id") or 999))
+    for idx, reel in enumerate(reels, start=1):
+        reel["id"] = int(reel.get("rank") or idx)
+    reels = reels[:num_reels]
+
+    analysis = {
+        "reels": reels,
+        "brand_story": brand,
+        "documentary_summary": documentary_summary,
+        "recommendations": normalize_recommendations(recommendations or {}),
+        "story_mode": story_mode,
+        "segment_count": len(segments),
+        "utterance_segments": segments,
+        "sentence_segments": segments,
+    }
+    _normalize_cut_sheets(
+        analysis,
+        words,
+        segments,
+        float(duration_seconds or 0),
+        story_mode=story_mode,
+        main_speaker_id=main_speaker_id,
+    )
+    _attach_verbatim_for_segments(analysis, {"words": words})
+    _attach_words(analysis, words)
+    return analysis
+
+
 def analyze_with_claude(
     transcript: dict,
     model: str,
@@ -303,12 +432,10 @@ def analyze_with_claude(
     if num_reels not in VALID_NUM_REELS:
         num_reels = DEFAULT_NUM_REELS
 
+    # Merge resolution: keep their prepare_segments() refactor (shared with the
+    # serverless step path) AND our request timeout + main-speaker identity.
     client = Anthropic(api_key=api_key, timeout=_CLAUDE_CLIENT_TIMEOUT_SECONDS)
-    words = normalize_word_timings(transcript.get("words") or [])
-    transcript = {**transcript, "words": words}
-    segments = build_sentence_segments(words, float(transcript.get("duration") or 0))
-    segmented_text = format_segments_for_claude(segments)
-    duration = fmt_time(transcript["duration"])
+    words, segments, segmented_text, duration = prepare_segments(transcript)
     main_speaker_id = _identify_main_speaker(segments)
 
     _log(progress_cb, f"Built {len(segments)} sentence segments from {len(words):,} words")
@@ -332,45 +459,29 @@ def analyze_with_claude(
     )
     reels_raw = selection.get("reels") or []
     documentary_summary = str(selection.get("documentary_summary") or "").strip()
-    recommendations = normalize_recommendations(selection.get("recommendations") or {})
-
-    reels = [_normalize_claude_reel(row, idx + 1) for idx, row in enumerate(reels_raw)]
-    reels.sort(key=lambda r: int(r.get("rank") or r.get("id") or 999))
-    for idx, reel in enumerate(reels, start=1):
-        reel["id"] = int(reel.get("rank") or idx)
-    reels = reels[:num_reels]
+    recommendations = selection.get("recommendations") or {}
 
     _log(progress_cb, "Crafting brand story...")
     brand = _call_with_retries(
-        lambda: _extract_brand_story(client, model, segmented_text, duration),
+        lambda: extract_brand_story(client, model, segmented_text, duration),
         progress_cb=progress_cb,
         label="Brand story extraction",
     )
 
-    analysis = {
-        "reels": reels,
-        "brand_story": brand,
-        "documentary_summary": documentary_summary,
-        "recommendations": recommendations,
-        "story_mode": story_mode,
-        "segment_count": len(segments),
-        "utterance_segments": segments,
-        "sentence_segments": segments,
-    }
-    _normalize_cut_sheets(
-        analysis,
+    _log(progress_cb, "Filling verbatim transcript text for each cut window...")
+    analysis = finalize_analysis(
+        reels_raw,
+        documentary_summary,
+        recommendations,
+        brand,
         words,
         segments,
         float(transcript.get("duration") or 0),
+        num_reels=num_reels,
         story_mode=story_mode,
         main_speaker_id=main_speaker_id,
     )
-
-    _log(progress_cb, "Filling verbatim transcript text for each cut window...")
-    _attach_verbatim_for_segments(analysis, transcript)
-
     _log(progress_cb, "Attaching Rev.ai word timestamps to each reel...")
-    _attach_words(analysis, words)
 
     return analysis
 
@@ -418,13 +529,14 @@ def select_reels(
     if _profile_is_v2():
         system += V2_PROMPT_ADDENDUM
 
+    deadline_s = _client_deadline_s(client)
     with client.messages.stream(
         model=model,
         max_tokens=12000,
         system=system,
         messages=[{"role": "user", "content": segmented_text}],
     ) as stream:
-        full_text = stream.get_final_text()
+        full_text, deadline_hit = _stream_final_text(stream, deadline_s=deadline_s)
 
     if raw_response_cb:
         raw_response_cb(full_text)
@@ -432,7 +544,12 @@ def select_reels(
     text = full_text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-    parsed = _parse_json_object(text)
+    try:
+        parsed = _parse_json_object(text)
+    except (ValueError, json.JSONDecodeError):
+        if deadline_hit:
+            raise _StreamDeadlineExceeded(f"Claude stream exceeded {deadline_s:.0f}s wall-clock cap")
+        raise
     return parsed
 
 
@@ -601,7 +718,7 @@ def _segments_to_cut_sheet(segments: list) -> list[dict]:
 
 # ── Pass 2: Brand story ────────────────────────────────────────────────────────
 
-def _extract_brand_story(
+def extract_brand_story(
     client: Anthropic, model: str, segmented_text: str, duration: str
 ) -> dict:
     prompt = f"""You are an elite brand storyteller, SEO copywriter, and content strategist.
@@ -702,13 +819,19 @@ OUTPUT — Return ONLY valid JSON. No markdown. No explanation.
   }}
 }}"""
 
+    deadline_s = _client_deadline_s(client)
     with client.messages.stream(
         model=model,
         max_tokens=6000,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
-        full_text = stream.get_final_text()
-    result = _parse_json(full_text, "brand_story")
+        full_text, deadline_hit = _stream_final_text(stream, deadline_s=deadline_s)
+    try:
+        result = _parse_json(full_text, "brand_story")
+    except (ValueError, json.JSONDecodeError):
+        if deadline_hit:
+            raise _StreamDeadlineExceeded(f"Claude stream exceeded {deadline_s:.0f}s wall-clock cap")
+        raise
     # Normalise — the JSON root key may or may not be nested
     if isinstance(result, dict) and "brand_story" in result:
         return result["brand_story"]
@@ -1282,7 +1405,11 @@ def _parse_json_object(text: str) -> dict:
     text = re.sub(r"\s*```$", "", text)
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
-        raise ValueError(f"Claude returned no valid JSON.\nResponse preview:\n{text[:500]}")
+        # Log the raw response server-side only — never surface model output in
+        # the exception message, since it propagates verbatim to job["error"]
+        # and gets shown to the user in the desktop app / web frontend.
+        print(f"[analyzer] Claude returned no valid JSON. Response preview:\n{text[:500]}", flush=True)
+        raise ValueError("Claude returned an unparsable response. Please try again.")
     parsed = json.loads(match.group())
     if not isinstance(parsed, dict):
         raise ValueError("Claude JSON root must be an object.")
@@ -1296,10 +1423,12 @@ def _parse_json(text: str, expected_key: str):
     text = re.sub(r"\s*```$", "", text)
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
-        raise ValueError(
-            f"Claude returned no valid JSON for '{expected_key}'.\n"
-            f"Response preview:\n{text[:500]}"
+        print(
+            f"[analyzer] Claude returned no valid JSON for '{expected_key}'. "
+            f"Response preview:\n{text[:500]}",
+            flush=True,
         )
+        raise ValueError(f"Claude returned an unparsable response for '{expected_key}'. Please try again.")
     parsed = json.loads(match.group())
     # Unwrap top-level key if present
     if expected_key in parsed:

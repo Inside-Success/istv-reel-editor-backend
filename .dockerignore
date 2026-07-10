@@ -1,0 +1,27 @@
+# Never ship source media or generated job output into the image.
+input/
+generated_data/
+export/
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.m4v
+*.zip
+
+# Local dev / VCS / secrets — the container gets its config from real env vars.
+.git/
+.venv/
+__pycache__/
+*.pyc
+.env
+backend/jobs.db
+
+# Not needed at runtime.
+*.md
+reels-pipeline-logic.md
+theupdatelog.md
+generate_reels.bat
+export_cli.py
+sync_cameras_cli.py

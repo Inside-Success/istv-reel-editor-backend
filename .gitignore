@@ -27,3 +27,11 @@ backend/jobs.db
 
 # Local Claude Code runtime artifacts
 .claude/
+
+# Deployment (Vercel) + any .env variant
+.vercel
+.env*
+
+# Desktop app build + deps
+desktop/dist
+desktop/node_modules
