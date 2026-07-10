@@ -41,15 +41,16 @@ from backend import job_store_pg as _pg_job_store  # noqa: E402
 # what this module was built around, when no database is set up.
 job_store = _pg_job_store if (os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip() else _sqlite_job_store  # noqa: E402
 
-# Chunked uploads (see /transcribe/init|chunk|finish) buffer in the process's
-# _UPLOADS dict by default, which only works when a *single* process serves
-# every chunk of a given upload — behind a load balancer, across a redeploy, or
-# after a spin-down, chunks for one upload_id get spread over processes that
-# never saw its /init and return 404 (the "some chunks 200, some 404, finish
-# 404" failure). When Postgres backs the store we persist chunks there instead,
-# so any process can assemble the upload. Local SQLite has no chunk table, so it
-# stays on the in-memory path (fine for a single-process dev/instance).
-_CHUNKS_IN_DB = hasattr(job_store, "save_chunk")  # noqa: E402
+# Postgres is a *shared* store: any process can read/write it, and it survives
+# restarts. The in-memory _JOBS/_UPLOADS dicts below are per-process, so they
+# only work when a single process serves every request for a given job/upload.
+# That assumption breaks across a redeploy (Render does a rolling cutover where
+# the old and new instance both serve traffic briefly) or any restart: a job or
+# upload created on one process is invisible to another, which then 404s. When a
+# shared store is configured we treat *it* as the source of truth for both job
+# status reads and chunked uploads; local SQLite (single-process dev) keeps the
+# fast in-memory path.
+_SHARED_STORE = hasattr(job_store, "save_chunk")  # noqa: E402
 from src.transcription import poll_transcription_job, transcribe_audio  # noqa: E402
 from src.transcript_cleanup import correct_transcript_words  # noqa: E402
 from src.analyzer import analyze_with_claude, DEFAULT_CLAUDE_MODEL  # noqa: E402
@@ -301,7 +302,7 @@ async def transcribe_init() -> dict:
     # to pre-create, and nothing that a different process would need to have seen
     # first. The in-memory path still seeds an empty dict so /chunk can tell a
     # known upload from a stale one.
-    if not _CHUNKS_IN_DB:
+    if not _SHARED_STORE:
         with _UPLOAD_LOCK:
             _UPLOADS[upload_id] = {}
     return {"upload_id": upload_id}
@@ -313,7 +314,7 @@ async def transcribe_chunk(upload_id: str, request: Request) -> dict:
     if idx_header is None:
         raise HTTPException(status_code=400, detail="Missing X-Chunk-Index header")
     body = await request.body()
-    if _CHUNKS_IN_DB:
+    if _SHARED_STORE:
         # Any process can persist this chunk; /finish reads them all back.
         job_store.save_chunk(upload_id, int(idx_header), body)
         return {"ok": True}
@@ -329,7 +330,7 @@ async def transcribe_chunk(upload_id: str, request: Request) -> dict:
 async def transcribe_finish(upload_id: str, request: Request) -> dict:
     payload = await request.json()
     fname = str(payload.get("filename") or "audio.mp3")
-    if _CHUNKS_IN_DB:
+    if _SHARED_STORE:
         body = job_store.load_chunks(upload_id)
         job_store.delete_chunks(upload_id)
         if not body:
@@ -389,22 +390,31 @@ async def select(request: Request) -> dict:
 
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
-    with _LOCK:
-        job = _JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        out = {
-            "status": job["status"],
-            "message": job["message"],
-            "elapsed": job.get("elapsed", 0),
-            "error": job["error"],
-        }
-        if job["status"] == "done":
-            if job.get("transcript") is not None:
-                out["transcript"] = job["transcript"]
-            if job.get("analysis") is not None:
-                out["analysis"] = job["analysis"]
-        return out
+    # With a shared store, read status straight from it rather than this
+    # process's _JOBS dict. The worker thread that owns the job writes every
+    # update through to the store (see _set), so the store is always current —
+    # and it's the only copy a *different* process (e.g. the new instance during
+    # a rolling redeploy) can see. Reading _JOBS here is what made polls 404
+    # when they landed on a process that never created the job.
+    if _SHARED_STORE:
+        job = job_store.load(job_id)
+    else:
+        with _LOCK:
+            job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    out = {
+        "status": job["status"],
+        "message": job.get("message"),
+        "elapsed": job.get("elapsed", 0),
+        "error": job.get("error"),
+    }
+    if job["status"] == "done":
+        if job.get("transcript") is not None:
+            out["transcript"] = job["transcript"]
+        if job.get("analysis") is not None:
+            out["analysis"] = job["analysis"]
+    return out
 
 
 # ── Startup: reload persisted jobs and resume in-flight ones ────────────────
