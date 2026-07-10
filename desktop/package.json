@@ -38,7 +38,8 @@
     "publish": {
       "provider": "github",
       "owner": "Inside-Success",
-      "repo": "istv-reel-editor-backend"
+      "repo": "istv-reel-editor-backend",
+      "releaseType": "release"
     },
     "win": {
       "target": "nsis"
