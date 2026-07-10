@@ -33,13 +33,19 @@ MAX_CONTEXT_BRIDGE_SEGMENTS = 4
 MAX_WORD_CONTINUATION = 10
 MAX_CONTEXT_HEAD_PREPENDS = 2
 
-# Extra seconds the cutter may exceed (or fall under) the target window so reels
-# land on a COMPLETE thought / open with full context instead of a hard
-# mid-sentence cut. This is a soft ceiling used only when the story demands it
-# (extending a dangling ending or prepending setup) — never a target length.
-# Widened from 10s: abrupt/incomplete endings matter far more than staying
-# inside the window, so the cutter needs real room to let a thought land.
+# Extra seconds the cutter may exceed the target window so reels land on a
+# COMPLETE thought instead of a hard mid-sentence cut. This is a soft ceiling
+# used only when the story demands it (extending a dangling ending) — never a
+# target length. Widened from 10s: abrupt/incomplete endings matter far more
+# than staying inside the window, so the cutter needs real room to let a
+# thought land. At defaults (max=90s) this gives a 110s hard ceiling.
 REEL_END_TOLERANCE_SECONDS = 20.0
+
+# Separate, smaller tolerance on the FLOOR side — asymmetric on purpose. The
+# user's stated priority: 45-90s first, 30-110s as the extended-but-still-fine
+# range if the story demands it. That's a 15s floor flex (45-15=30) against a
+# 20s ceiling flex (90+20=110), not a symmetric ±20s on both ends.
+REEL_FLOOR_TOLERANCE_SECONDS = 15.0
 
 
 def reel_max_seconds() -> float:
@@ -500,22 +506,29 @@ def _segment_has_emotional_landing(text: str) -> bool:
 
 
 def _tail_segment_resolves_bridge(prev_seg: dict, next_seg: dict) -> bool:
-    """True when the next segment completes a phrase split across the boundary."""
+    """True when the next segment's OPENING continues a phrase split at the seam
+    with the previous segment's ENDING.
+
+    Checked only at the actual boundary (last word of prev vs. first word of
+    next, via the same general split-phrase check `_word_pair_continues` uses
+    at the word level) — never by scanning the full combined text of both
+    segments. A fixed phrase list matched anywhere in that combined text used
+    to fire a false "already resolved" positive whenever the phrase happened
+    to appear earlier in a long prior segment, unrelated to where the two
+    segments actually meet — the same class of memorized-snippet bug already
+    cleaned out of DANGLING_END_PHRASES.
+    """
     last_text = str(prev_seg.get("text") or "").strip()
     next_text = str(next_seg.get("text") or "").strip()
     if not last_text or not next_text:
         return False
-    combined = f"{last_text} {next_text}".lower()
-    bridge_phrases = (
-        "into my career",
-        "my career",
-        "years into my career",
-        "in the middle of my career",
-        "had to leave",
-    )
-    if any(phrase in combined for phrase in bridge_phrases):
+    prev_words = last_text.split()
+    next_words = next_text.split()
+    if not prev_words or not next_words:
+        return False
+    if _word_pair_continues({"word": prev_words[-1]}, {"word": next_words[0]}):
         return True
-    first = _clean_token(next_text.split()[0])
+    first = _clean_token(next_words[0])
     return first in STRONG_END_WORDS
 
 
@@ -562,6 +575,15 @@ def build_reel_cut_sheet(
     segment_ids = _cap_segment_ids(segment_ids, seg_by_id, soft_cap, protect_ends=protect_ends)
     segment_ids = _extend_resolved_tail_ids(segment_ids, seg_by_id, soft_cap)
     segment_ids = _trim_dangling_tail_ids(segment_ids, seg_by_id)
+    # Trimming a dangling tail (above) retreats backward and can free up real
+    # room under soft_cap that the pre-trim extend call never had — without
+    # this second pass, a reel that got capped mid-thought would retreat to
+    # the last landed sentence and simply stop there, even when the very next
+    # same-speaker sentence would have completed the thought within budget.
+    # This is the mechanical equivalent of the prompt's "look ahead, and only
+    # retreat if the next sentence doesn't land it" rule — enforced here too
+    # so it holds even when Claude's own pick didn't get it exactly right.
+    segment_ids = _extend_resolved_tail_ids(segment_ids, seg_by_id, soft_cap)
     reel["segment_ids"] = segment_ids
 
     runs = _contiguous_runs(segment_ids)
@@ -761,7 +783,13 @@ def _cap_segment_ids(
 
 def _trim_dangling_tail_ids(segment_ids: list[int], seg_by_id: dict[int, dict]) -> list[int]:
     ids = list(segment_ids)
-    while ids:
+    # Never retreat past the single last segment, even if it's still judged
+    # dangling — an imperfect-but-present ending beats an empty reel. Real risk
+    # now that _segment_text_dangles defaults to "dangling" for text with no
+    # terminal punctuation and no other signal: a run of segments that never
+    # happens to land on a period (fast talker, sentence-split heuristic
+    # landed mid-clause) could otherwise get trimmed away to nothing.
+    while len(ids) > 1:
         last = seg_by_id.get(ids[-1])
         if not last:
             break
@@ -830,6 +858,18 @@ def _extend_end_through_continuation_words(
         cur = words_by_index.get(idx)
         nxt = words_by_index.get(idx + 1)
         if not cur or not nxt:
+            break
+        # `cur_tok` strips punctuation before the DANGLING_END_WORDS/
+        # INCOMPLETE_END_WORDS lookup, so a genuinely finished word like
+        # "do." collapses to the bare token "do" — which IS in
+        # DANGLING_END_WORDS as a bare word. Without checking the word's
+        # OWN raw punctuation first, this pulled the cut into the next
+        # sentence even though "do." already had a period ending it
+        # (found live: "...no limit to what you can do." got extended into
+        # "So the vision of..." purely because "do" looks dangling in
+        # isolation). Terminal punctuation on the current word is decisive
+        # and always wins over the bare-token word-list heuristic.
+        if str(cur.get("word") or "").rstrip()[-1:] in ".!?":
             break
         cur_tok = _clean_token(str(cur.get("word") or ""))
         nxt_tok = _clean_token(str(nxt.get("word") or ""))
@@ -901,7 +941,19 @@ def _segment_text_dangles(text: str) -> bool:
             return True
         if any(lower.endswith(phrase) for phrase in V2_EXTRA_DANGLING_PHRASES):
             return True
-    return False
+    # Reaching here means: no terminal punctuation, and no known-good override
+    # (STRONG_END_WORDS) or known-bad word/phrase matched either — genuinely
+    # ambiguous by the word-list heuristics alone. Rev.ai's punctuation model
+    # reliably terminates an actually-complete spoken sentence with . / ? / ! ,
+    # so the absence of it here (now that punctuation reaches this text at
+    # all — see src/transcription.py's Rev.ai punct-element fix) is itself a
+    # real signal, not silence. Defaulting to "dangling" is the deliberately
+    # safe direction: it triggers the SAME look-ahead-then-retreat machinery
+    # (_extend_resolved_tail_ids / _trim_dangling_tail_ids) as any other
+    # dangling classification, never an outright drop — worst case it pulls
+    # in one more sentence or retreats to the prior landed one, exactly what
+    # "look at the next sentence, otherwise cut the previous one" asks for.
+    return True
 
 
 def _cap_reel_duration(

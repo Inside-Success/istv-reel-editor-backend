@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld("api", {
   loadProject: () => ipcRenderer.invoke(C.LOAD_PROJECT),
 
   pickExportDir: () => ipcRenderer.invoke(C.PICK_EXPORT_DIR),
+  pickEndCredits: () => ipcRenderer.invoke(C.PICK_END_CREDITS),
   exportReels: (args) => ipcRenderer.invoke(C.EXPORT_REELS, args),
   onExportEvent: (cb) => {
     const handler = (_evt, e) => cb(e);

@@ -24,7 +24,14 @@ def verbatim_from_words(
             we = float(w.get("end") or ws)
         except (TypeError, ValueError):
             continue
-        if we < lo or ws > hi:
+        # Window is [lo, hi) — exclusive on both sides. `ws >= hi` excludes a
+        # word starting exactly at the window's end; `we <= lo` (not `<`)
+        # excludes the mirror case, a word ending exactly where this window
+        # starts. Both matter when a same-speaker segment sits with zero gap
+        # against a different speaker's segment on either side (a real
+        # interruption/overlap in the source audio) — same boundary issue
+        # fixed in analyzer.py's _attach_words.
+        if we <= lo or ws >= hi:
             continue
         token = str(w.get("word") or "").strip()
         if token:

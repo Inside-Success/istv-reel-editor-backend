@@ -41,7 +41,7 @@ from src.validate import validate_summary
 DEFAULT_PROFILE = {
     "REEL_PROFILE": "v2",
     "REEL_CONTEXT_AWARE": "1",
-    "REEL_MIN_SECONDS": "30",
+    "REEL_MIN_SECONDS": "45",
     "REEL_MAX_SECONDS": "90",
     "REEL_CAPTION_CHUNK": "4",
     "REEL_TEXT_OVERLAYS": "0",

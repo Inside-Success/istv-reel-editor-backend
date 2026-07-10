@@ -112,7 +112,21 @@ def _parse(raw: dict) -> dict:
                 word_index += 1
                 text_parts.append(el["value"])
             elif el.get("type") == "punct":
-                text_parts.append(el.get("value", ""))
+                value = el.get("value", "")
+                text_parts.append(value)
+                # Rev.ai reports punctuation as separate elements between words
+                # (often just whitespace) — attach the actual mark (".", "?",
+                # "!", ",", etc.) onto the word it follows so every downstream
+                # consumer (sentence segment text shown to Claude, the
+                # "ends with .!?" completeness check in src/cutter.py, burned-in
+                # captions) can tell a landed sentence from a mid-thought cut.
+                # Before this, punctuation only ever reached `full_text` here —
+                # word tokens and everything built from them were always bare,
+                # so the primary "is this ending actually finished" signal was
+                # silently unavailable everywhere it mattered.
+                mark = value.strip()
+                if mark and words:
+                    words[-1]["word"] = f"{words[-1]['word']}{mark}"
 
     words = normalize_word_timings(words)
     duration = words[-1]["end"] if words else 0.0

@@ -90,7 +90,7 @@ function syncCameras({ referenceAudioPath, cameras, onEvent }) {
       if (code === 0) {
         resolve(results);
       } else {
-        reject(new Error(stderr.trim().slice(-400) || `Sync exited ${code}`));
+        reject(new Error(stderr.trim().slice(-1200) || `Sync exited ${code}`));
       }
     });
   });

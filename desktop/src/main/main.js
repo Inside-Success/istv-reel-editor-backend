@@ -344,6 +344,19 @@ ipcMain.handle(C.PICK_EXPORT_DIR, async () => {
   return res.filePaths[0];
 });
 
+ipcMain.handle(C.PICK_END_CREDITS, async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: "Choose end credits video",
+    properties: ["openFile"],
+    filters: [
+      { name: "Video", extensions: ["mp4", "mov", "mkv", "avi", "webm", "m4v"] },
+      { name: "All files", extensions: ["*"] },
+    ],
+  });
+  if (res.canceled || !res.filePaths.length) return null;
+  return res.filePaths[0];
+});
+
 ipcMain.handle(C.EXPORT_REELS, async (evt, { srcPath, outDir, reels, dialog: dlg, cameras }) => {
   if (!srcPath || !fs.existsSync(srcPath)) throw new Error(`Master not found: ${srcPath}`);
   if (!outDir) throw new Error("No export destination chosen");

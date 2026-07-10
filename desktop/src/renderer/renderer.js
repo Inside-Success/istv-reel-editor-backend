@@ -231,6 +231,14 @@ function applyReelSelectionResult(res) {
 
 async function generateReels() {
   if (!state.srcPath) return;
+  // Generate/retry have no backend cancellation — if the user opens a
+  // different project while this call is still in flight, resetProjectState()
+  // runs immediately (synchronously) but this promise keeps running in the
+  // background and would otherwise still call applyReelSelectionResult()
+  // later, stomping the NEW project's transcript/reels with the old job's
+  // stale result. Snapshot the project this call belongs to and only apply
+  // the result if it's still the open project when the call resolves.
+  const forSrcPath = state.srcPath;
   $("genBtn").disabled = true;
   resetPipeline();
   $("pipelineRetrySelect").classList.add("hidden");
@@ -241,8 +249,10 @@ async function generateReels() {
   try {
     const name = $("nameInput").value.trim();
     const res = await window.api.generateReels(state.srcPath, name);
+    if (state.srcPath !== forSrcPath) return; // a different project is open now — discard
     applyReelSelectionResult(res);
   } catch (err) {
+    if (state.srcPath !== forSrcPath) return;
     setStatus("Generate Reels failed: " + err.message);
     // Transcription already succeeded (cached via the "transcribe" pipeline
     // event) even though something after it failed — offer to resume from
@@ -259,6 +269,7 @@ async function generateReels() {
 
 async function retrySelectionOnly() {
   if (!state.transcript) return;
+  const forSrcPath = state.srcPath; // see generateReels() for why this guard exists
   $("pipelineRetrySelect").disabled = true;
   setStatus("Retrying reel selection from the existing transcript…");
 
@@ -266,9 +277,11 @@ async function retrySelectionOnly() {
   try {
     const name = $("nameInput").value.trim();
     const res = await window.api.selectReelsOnly(state.transcript, name);
+    if (state.srcPath !== forSrcPath) return;
     applyReelSelectionResult(res);
     $("pipelineRetrySelect").classList.add("hidden");
   } catch (err) {
+    if (state.srcPath !== forSrcPath) return;
     setStatus("Retry failed: " + err.message);
   } finally {
     off();
@@ -332,13 +345,18 @@ const { recomputeReel, visibleWords, isFiller, editedText } = window.ReelModel;
  *  Recomputed on every trim so extending/cutting adds/drops subtitle words. */
 function wordsInSegments(allWords, segments) {
   const out = [];
-  for (const w of allWords) {
+  allWords.forEach((w, pos) => {
     const ws = Number(w.start) || 0;
     const we = w.end != null ? Number(w.end) : ws;
     if (segments.some((s) => we > s.startSec && ws < s.endSec)) {
-      out.push({ index: w.index, word: w.word, start: ws, end: we });
+      // Same fallback as model.js's visibleWords() — if a word ever lacks a
+      // stable global index, buildSubEditor uses `index` directly (no
+      // fallback of its own) to key subtitleEdits, so every such word would
+      // collapse onto the same `undefined` key and editing one would edit
+      // them all.
+      out.push({ index: w.index != null ? w.index : pos, word: w.word, start: ws, end: we });
     }
-  }
+  });
   out.sort((a, b) => a.start - b.start);
   return out;
 }
@@ -779,6 +797,11 @@ const exportState = {
   format: "mp4",
   losslessAudio: false,
   outDir: null,
+  // End credits: purely an export-time choice (see index.html) — never
+  // written into reel/segment data, so the editor timeline is untouched
+  // regardless of whether this is on.
+  includeEndCredits: false,
+  endCreditsPath: null,
 };
 
 function openExportDialog() {
@@ -790,7 +813,8 @@ function openExportDialog() {
 }
 
 function updateExportStartEnabled() {
-  $("exportStart").disabled = !exportState.outDir;
+  const creditsReady = !exportState.includeEndCredits || !!exportState.endCreditsPath;
+  $("exportStart").disabled = !exportState.outDir || !creditsReady;
 }
 
 function wireSeg(containerId, key) {
@@ -857,6 +881,8 @@ async function runExport() {
         quality: exportState.quality,
         format: exportState.format,
         losslessAudio: exportState.losslessAudio,
+        includeEndCredits: exportState.includeEndCredits,
+        endCreditsPath: exportState.endCreditsPath,
       },
       cameras: state.cameras,
     });
@@ -1218,6 +1244,21 @@ function wire() {
     if (dir) {
       exportState.outDir = dir;
       $("expDirPath").textContent = dir;
+      updateExportStartEnabled();
+    }
+  });
+
+  $("expEndCredits").addEventListener("change", (e) => {
+    exportState.includeEndCredits = e.target.checked;
+    $("expPickEndCredits").disabled = !e.target.checked;
+    updateExportStartEnabled();
+  });
+  $("expPickEndCredits").addEventListener("click", async () => {
+    const filePath = await window.api.pickEndCredits();
+    if (filePath) {
+      exportState.endCreditsPath = filePath;
+      $("expEndCreditsPath").textContent = filePath.split(/[\\/]/).pop();
+      $("expEndCreditsPath").title = filePath;
       updateExportStartEnabled();
     }
   });

@@ -6,13 +6,9 @@ import re
 
 from src.cutter import (
     CONTEXT_OPENER_WORDS,
-    DANGLING_END_PHRASES,
-    DANGLING_END_WORDS,
-    INCOMPLETE_END_WORDS,
     MAX_REEL_SECONDS,
     SELF_CONTAINED_OPENERS,
-    STRONG_END_WORDS,
-    _segment_has_emotional_landing,
+    _segment_text_dangles,
 )
 
 LEAD_DEAD_AIR_THRESHOLD = 0.35
@@ -45,10 +41,28 @@ def validate_reel(reel: dict, *, max_len: float = MAX_REEL_SECONDS) -> list[str]
         issues.append(f"Reel {rank}: unresolved context opening — '{first_text[:60]}'")
 
     last_text = _last_spoken_text(reel, words)
-    if last_text and _text_dangles(last_text):
+    if last_text and _segment_text_dangles(last_text):
         issues.append(f"Reel {rank}: dangling ending — '{last_text[-60:]}'")
 
+    speaker_issue = _multi_speaker_issue(words)
+    if speaker_issue:
+        issues.append(f"Reel {rank}: {speaker_issue}")
+
     return issues
+
+
+def _multi_speaker_issue(words: list[dict]) -> str:
+    """Non-empty string if the reel's attached words span more than one speaker.
+
+    Mirrors the "ONE SPEAKER ONLY" prompt rule and the mechanical filter in
+    `_normalize_cut_sheets` (src/analyzer.py) — this is the independent,
+    after-the-fact check: if either of those ever regresses, this is what
+    would actually catch a multi-speaker reel making it into the output.
+    """
+    speakers = {int(w.get("speaker", 0) or 0) for w in words if isinstance(w, dict)}
+    if len(speakers) <= 1:
+        return ""
+    return f"multiple speakers in one reel: {sorted(speakers)}"
 
 
 def validate_analysis(analysis: dict, *, max_len: float = MAX_REEL_SECONDS) -> dict[str, list[str]]:
@@ -107,23 +121,3 @@ def _opening_needs_context(text: str) -> bool:
     if first in SELF_CONTAINED_OPENERS:
         return False
     return first in CONTEXT_OPENER_WORDS
-
-
-def _text_dangles(text: str) -> bool:
-    cleaned = str(text or "").strip()
-    if not cleaned:
-        return True
-    if _segment_has_emotional_landing(cleaned):
-        return False
-    if cleaned[-1] in ".!?":
-        return False
-    tokens = [re.sub(r"[^a-z0-9']+", "", t.lower()) for t in cleaned.split()]
-    if not tokens:
-        return True
-    last = tokens[-1]
-    if last in STRONG_END_WORDS:
-        return False
-    if last in DANGLING_END_WORDS or last in INCOMPLETE_END_WORDS:
-        return True
-    lower = cleaned.lower()
-    return any(lower.endswith(phrase) for phrase in DANGLING_END_PHRASES)

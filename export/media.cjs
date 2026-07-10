@@ -66,8 +66,9 @@ async function probeVideo(filePath) {
   const data = JSON.parse(stdout || "{}");
   const streams = data.streams || [];
   const vstream = streams.find((stream) => stream.codec_type === "video");
+  const hasAudio = streams.some((stream) => stream.codec_type === "audio");
   if (!vstream) {
-    return { width: 0, height: 0, duration: 0, fps: 0, hasVideo: false };
+    return { width: 0, height: 0, duration: 0, fps: 0, hasVideo: false, hasAudio };
   }
   const fpsParts = String(vstream.r_frame_rate || "30/1").split("/");
   const fps = Number(fpsParts[0]) / (Number(fpsParts[1]) || 1);
@@ -77,6 +78,7 @@ async function probeVideo(filePath) {
     duration: Number(vstream.duration) || 0,
     fps: fps || 30,
     hasVideo: true,
+    hasAudio,
   };
 }
 
@@ -568,6 +570,11 @@ async function exportReel(sourcePath, outputPath, payload) {
     // `camera`, or a `camera` not present here, use `sourcePath` unchanged —
     // existing single-camera payloads need no changes at all.
     sources = {},
+    // Optional end-credits clip, appended AFTER the reel content — purely an
+    // export-time concatenation. Never touches segments/timeline/editor state;
+    // the user's choice to include it lives only in the export dialog, and it
+    // gets baked in only on the render that actually produces the file.
+    endCreditsPath = "",
   } = payload;
 
   // mkdtempSync (not Date.now()-based naming) guarantees a unique dir even when
@@ -699,11 +706,27 @@ async function exportReel(sourcePath, outputPath, payload) {
       args.push("-i", musicPath);
     }
 
+    const hasCredits = Boolean(endCreditsPath && fs.existsSync(endCreditsPath));
+    let creditsIndex = -1;
+    let creditsProbe = null;
+    if (hasCredits) {
+      creditsProbe = await probeVideo(endCreditsPath);
+      if (!creditsProbe.hasVideo) {
+        throw new Error(`End credits file has no video stream: ${endCreditsPath}`);
+      }
+      creditsIndex = segs.length + (hasMusic ? 1 : 0);
+      args.push("-i", endCreditsPath);
+    }
+
     const concatInputs = segs.map((_, i) => `[v${i}][a${i}]`).join("");
     filterParts.push(`${concatInputs}concat=n=${segs.length}:v=1:a=1[vcat][acat]`);
     filterParts.push(`[vcat]${crop}[vcrop]`);
-    filterParts.push(`[vcrop]subtitles='${assEscaped}'[vout]`);
+    // Captions are burned in here, before any credits concat below, so the
+    // credits clip (a separate, already-finished asset) never gets subtitles
+    // drawn over it.
+    filterParts.push(`[vcrop]subtitles='${assEscaped}'[vreel]`);
 
+    let videoLabel = "[vreel]";
     let audioLabel = "[acat]";
     if (hasMusic) {
       filterParts.push(`[${musicIndex}:a]volume=${musicVolume}[am1]`);
@@ -712,8 +735,42 @@ async function exportReel(sourcePath, outputPath, payload) {
       audioLabel = "[aout]";
     }
 
+    if (hasCredits) {
+      // Scale+pad (never crop) so the credits asset — a pre-made, designed clip,
+      // not raw footage to reframe — is shown in full, letterboxed if its aspect
+      // doesn't already match the export canvas exactly.
+      const targetFps = Math.round(sourceProbe.fps || 30);
+      filterParts.push(
+        `[${creditsIndex}:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,` +
+          `pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${targetFps}[vcredits]`,
+      );
+      if (creditsProbe.hasAudio) {
+        // Force stereo explicitly — concat requires matching channel layouts
+        // across the two audio streams it joins, and a credits asset (often
+        // exported separately, e.g. mono voiceover) isn't guaranteed to match
+        // the main reel audio's channel count otherwise.
+        filterParts.push(
+          `[${creditsIndex}:a]aresample=48000,aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS[acredits]`,
+        );
+      } else {
+        const creditsDur = creditsProbe.duration > 0 ? creditsProbe.duration : 3;
+        filterParts.push(`anullsrc=r=48000:cl=stereo:d=${creditsDur.toFixed(3)}[acredits]`);
+      }
+      // Normalize the main reel's audio to the same layout right before the
+      // join — it was never forced to stereo mid-graph before (only at final
+      // output encode), which is fine for a single stream but concat needs
+      // both sides to already match.
+      filterParts.push(`${audioLabel}aformat=channel_layouts=stereo[areel]`);
+      audioLabel = "[areel]";
+      filterParts.push(
+        `${videoLabel}${audioLabel}[vcredits][acredits]concat=n=2:v=1:a=1[vout][aoutfinal]`,
+      );
+      videoLabel = "[vout]";
+      audioLabel = "[aoutfinal]";
+    }
+
     args.push("-filter_complex", filterParts.join(";"));
-    args.push("-map", "[vout]", "-map", audioLabel);
+    args.push("-map", videoLabel, "-map", audioLabel);
     args.push(
       ...videoArgs,
       "-aspect",

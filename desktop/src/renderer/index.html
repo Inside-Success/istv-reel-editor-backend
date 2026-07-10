@@ -242,6 +242,17 @@
               </label>
             </div>
             <div class="exp-row">
+              <label>End credits</label>
+              <label class="exp-checkbox">
+                <input type="checkbox" id="expEndCredits" />
+                Add end credits clip (appended only in the exported file — timeline stays as-is)
+              </label>
+              <div class="exp-dest">
+                <button id="expPickEndCredits" class="btn sm" disabled>Choose video…</button>
+                <span id="expEndCreditsPath" class="dim">—</span>
+              </div>
+            </div>
+            <div class="exp-row">
               <label>Destination</label>
               <div class="exp-dest">
                 <button id="expPickDir" class="btn sm">Choose folder…</button>

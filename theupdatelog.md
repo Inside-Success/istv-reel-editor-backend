@@ -6,6 +6,312 @@ each session instead of editing old ones.
 
 ---
 
+## 2026-07-10 (evening) — Real-footage iteration loop: found and fixed the actual multi-speaker/dangling-ending root causes
+
+After the punctuation/bridge/end-credits round earlier today, real exports
+still showed the same problems. Instead of another prompt-wording pass, ran
+the actual analyzer+cutter against two real interviews end-to-end
+(`generated_data/prompt_iteration_2026-07-10/`) — David Christensen (real
+Rev.ai transcription, ~24 min) and Patricia Gallagher (an existing
+sentence-level transcript from a different tool, converted to our word-level
+format with synthetic per-word timing so no Rev.ai re-run was needed) — up to
+5 attempts each, reviewing actual Claude picks and real segment/word data
+after every run, fixing the root cause found, and re-running. Every attempt's
+raw Claude response, resolved analysis, and an automated scorecard
+(speaker-purity + dangling-ending checks) are saved under each
+`<video>/attempt_N/` folder. Final result: **0 validator issues on both
+videos** (down from 3 multi-speaker + 2 dangling-ending issues on Patricia's
+first attempt), reels exported to `FINAL/<video>/exported/`.
+
+**Root causes found this round (all in `src/analyzer.py` unless noted) — the
+mechanical single-speaker filter and prompt rules from earlier today were
+real, but every one of these ran AFTER them and silently undid their work:**
+
+1. **`_maybe_extend_playback_rows`** (the floor-padding step that stretches
+   short reels toward 45s) walked forward through segments by TIME only,
+   with no speaker check at all, and wrote straight to the row's
+   `end_time_seconds` without ever touching `reel["segment_ids"]` — so the
+   segment-id list looked perfectly single-speaker while the actual
+   rendered clip played straight through a different speaker's segment.
+   Added a `main_speaker_id` parameter and a `ceiling` that stops padding at
+   the start of the next different-speaker segment.
+2. Once padding respected the speaker ceiling, it still stopped the instant
+   the numeric floor was satisfied, with no check for whether that landing
+   segment was actually a complete thought — reproduced live: a reel ended
+   on "...give me a male's mentality," (a comma mid-list) instead of the
+   next segment, "but a woman's fortitude." Fixed to keep walking through
+   same-speaker segments until landing on a clean one, and to fall back to
+   the original (already-clean) boundary rather than accept a dangling one
+   if nothing further ahead is clean.
+3. **Zero-gap speaker boundaries**: when a same-speaker segment ends with NO
+   gap before a different speaker's segment (a real interruption in the
+   source audio — reproduced live twice, in both directions), the computed
+   boundary landed EXACTLY on the foreign word's start/end time, and
+   `_attach_words()`'s inclusion check (`ws > end` / `we < start`) was
+   inclusive of that exact tie, letting one foreign word slip through
+   despite every speaker guard. Fixed the boundary math to leave a real gap
+   (`NEXT_WORD_GUARD_SEC`) and hardened `_attach_words()` / the identical
+   helper `verbatim_from_words()` (`src/transcript_snippets.py`) to treat
+   the window as properly exclusive on both ends.
+4. **`_extend_end_through_continuation_words`** (`src/cutter.py`, word-level
+   tail padding) strips punctuation before checking `DANGLING_END_WORDS` —
+   so `"do."` (already a complete sentence) collapses to the bare token
+   `"do"`, which IS in that list, and the cut got pulled into the next
+   sentence anyway ("...you can do." → "...you can do. So the vision
+   of..."). Now breaks immediately if the current word already ends with
+   terminal punctuation — punctuation always wins over the bare-token
+   heuristic.
+5. **`select_reels()` / `correct_transcript_words()`** had no client-level
+   timeout — a stalled streaming response (seen live, 25+ minutes with zero
+   bytes and no error) hung indefinitely with no retry, which in the real
+   app looks like the pipeline being permanently stuck. Added a bounded
+   `timeout=` on the Anthropic client (600s for selection, 120s for
+   cleanup chunks) so a stall surfaces as a retryable `APITimeoutError`
+   instead.
+6. **`select_reels()` / `analyze_with_claude()`** gained an optional
+   `raw_response_cb` so every attempt's exact raw Claude response can be
+   archived, independent of how it gets parsed — this is what let every
+   attempt in this round save its literal `claude_raw_response_N.txt`.
+7. **`src/validate.py`** had its own hand-rolled, drifted copy of the
+   dangling-ending check (missing today's punctuation-awareness) and no
+   speaker check at all — now imports `_segment_text_dangles` directly from
+   `src/cutter.py` and gained a `_multi_speaker_issue()` check, so this
+   round's scorecards were checking the real thing.
+8. **`export_pipeline.py`**: exporting many reels concurrently from one
+   large source file (Patricia's is ~95 minutes) let a handful of ffmpeg
+   processes produce a valid-but-empty MP4 (0 media frames, exit code 0)
+   under I/O contention — reproduced live, 6 of 15 reels came back as
+   261-byte empty containers. Added a same-payload retry (with a timeout
+   safety net so a slow retry can't crash the whole batch uncaught, and a
+   brief re-check before declaring "too small" to rule out a Windows
+   filesystem-flush race) to `export_reel_mp4` / `export_reel_mp4_ex`.
+
+All fixes were verified two ways: targeted regression tests built directly
+from the exact real segment/word data that exposed each bug (not synthetic
+guesses), and full end-to-end re-runs against both real interviews.
+
+**Final results**, in `generated_data/prompt_iteration_2026-07-10/`:
+- **David Christensen**: 15/15 reels selected clean (0 validator issues) and
+  exported successfully — `FINAL/david/exported/`.
+- **Patricia Gallagher**: 15/15 reels selected clean (0 validator issues) —
+  the selection/analysis logic is fully validated — but only 4/15 could
+  actually be rendered to video. Found (via direct ffmpeg testing, confirmed
+  independent of this tool's code) that this specific copy of her source
+  file cannot be decoded past ~25 minutes in, via any seek strategy —
+  a structural defect in the source video itself, not a bug in the prompt,
+  analyzer, cutter, or export pipeline. Details and a path forward in
+  `FINAL/patricia/KNOWN_ISSUE_source_video.txt`.
+- Every attempt's raw Claude response, resolved analysis, and scorecard for
+  both videos are preserved under `<video>/attempt_1..5/` for traceability.
+
+Also fixed along the way: `export_pipeline.py`'s export retry didn't handle
+`subprocess.TimeoutExpired` (a slow retry could crash an otherwise-successful
+15-reel batch uncaught) and had a possible false-positive "too small" result
+on a Windows filesystem-flush race — both patched with a proper catch +
+brief re-check before giving up.
+
+---
+
+## 2026-07-10 (later) — Real punctuation loophole fixed, memorized-phrase bridge check fixed, end credits (export-only), project-wide bug sweep
+
+After the single-speaker/look-ahead/tiered-length round above, real footage
+still showed abrupt endings. Went first-principles through the whole
+transcription -> segmentation -> cutting pipeline instead of tuning prompt
+wording again.
+
+**The actual root cause of the ending problem:** `_parse()` in
+`src/transcription.py` captured Rev.ai's punctuation elements (periods,
+question marks, etc.) only for `full_text` — they were NEVER attached to the
+individual word tokens that sentence segments and Claude's prompt input are
+built from. That means every completeness check in the entire pipeline
+(`_segment_text_dangles()`'s "ends with `.!?`" check, and everything Claude
+itself read) has been working with **zero punctuation, always** — the single
+most reliable "is this ending actually finished" signal was silently dead
+from day one. Every previous round of endings fixes (word lists, tolerance
+constants, speaker checks) was patching around a completeness detector that
+never had real information to work with.
+
+**Fix:**
+- `_parse()` now attaches Rev.ai's punctuation mark onto the word it follows
+  (`words[-1]["word"] += mark`), so word text, sentence segment text, what
+  Claude sees in the prompt, and burned-in captions all carry real
+  punctuation for the first time.
+- `_segment_text_dangles()` (`src/cutter.py`): now that punctuation is real,
+  flipped the previously-unreached fallback case — text with no terminal
+  punctuation AND no other completeness signal now defaults to "dangling"
+  instead of "fine". Before, punctuation could never fire so this path was
+  silently permissive; now it's the trustworthy general signal it should
+  always have been. Only triggers the existing look-ahead-then-retreat
+  machinery, never an outright drop.
+- Added a floor guard in `_trim_dangling_tail_ids` so it can never retreat a
+  reel down to zero segments even in a pathological case.
+- Found and fixed a second, related memorized-phrase bug:
+  `_tail_segment_resolves_bridge` (`src/cutter.py`) matched a fixed phrase
+  list ("my career", "had to leave", etc. — leftovers from one specific past
+  transcript) *anywhere* in the combined text of two segments, not at the
+  actual boundary between them. Caught this live in testing: an unrelated
+  earlier mention of "my career" inside segment 0 falsely satisfied the
+  check and blocked a genuinely incomplete segment 1 from being trimmed.
+  Rewrote it to check only the real seam (last word of the prior segment vs.
+  first word of the next), reusing the existing general `_word_pair_continues`
+  check instead of a second memorized list.
+- Added one more `_extend_resolved_tail_ids` pass after the final trim in
+  `build_reel_cut_sheet`, so retreating from a bad cap-induced ending gets a
+  chance to look forward again into whatever room the retreat just freed up.
+- Verified with synthetic word-level tests: multi-speaker interjection
+  excluded, genuinely incomplete trailing clause correctly retreats, a
+  genuinely complete trailing sentence is kept, and a short dangling segment
+  correctly extends into a next segment that completes it.
+
+**New feature — optional end credits (export-time only):** Export dialog
+gained a checkbox + file picker ("Add end credits clip"). If checked, the
+chosen video is appended after the reel content, but **only in the rendered
+output file** — the editor timeline, segments, and reel data are never
+touched, exactly as requested. Implementation:
+- `export/media.cjs`: `exportReel` accepts an optional `endCreditsPath`.
+  Captions are burned onto the main reel content first (`[vreel]`), then the
+  credits clip is scaled+padded (never cropped — it's a designed asset, not
+  raw footage) to match the export canvas and concatenated on afterward in
+  the same single ffmpeg pass (no second encode). Handles credits clips with
+  no audio track (synthesizes silence via `anullsrc`) and normalizes both
+  sides to stereo/48kHz before the concat (ffmpeg's concat filter requires
+  matching audio layouts).
+- `export_pipeline.py` / `desktop/src/main/export.js`: thread
+  `endCreditsPath` through from the export dialog's `options`, only applied
+  when both the checkbox is on and a file is chosen.
+- `desktop/src/main/main.js`: new file-picker IPC channel
+  (`export:pick-end-credits`) mirroring the existing camera/music pickers.
+- Verified end-to-end with real ffmpeg smoke tests: credits-with-audio,
+  credits-without-audio, and the no-credits path (regression check) all
+  produce correct combined-duration output.
+
+**Bug sweep (before and after implementing end credits, as requested):**
+dispatched a parallel Python + Electron audit, then fixed the clearest real
+findings:
+- `export_pipeline.py`: the marketing-doc/zip filename stem was computed via
+  `video_stem.split("_")[1]`, which silently discarded most of the filename
+  for any source video with more than one underscore in its name (e.g.
+  "Jane_Doe_Interview.mp4" produced the stem "Doe"). Now uses the full stem.
+- `backend/job_store.py`: `purge_older_than()` deleted rows purely by age,
+  including still-in-flight jobs — combined with running before `load_all()`
+  in `_bootstrap_jobs`, a job whose `updated_at` hadn't ticked in 24h+
+  (backend down over a weekend, a crash mid-run) could get silently deleted
+  before it ever got a chance to resume; the client just saw a 404. Now
+  excludes in-flight statuses from the purge regardless of age.
+- `desktop/src/renderer/renderer.js`: `wordsInSegments()` stored a word's
+  global `index` with no fallback, unlike `model.js`'s `visibleWords()` and
+  `export.js`'s `toExportReel()`, both of which already defend against a
+  missing index. `buildSubEditor()` uses that index directly as the
+  subtitle-edit key with no fallback of its own — if `index` were ever
+  missing, every word in a reel would collapse onto the same edit key.
+  Matched the existing fallback pattern.
+- `desktop/src/renderer/renderer.js`: `generateReels()` / `retrySelectionOnly()`
+  had no guard against a project switch mid-flight — since there's no backend
+  job cancellation, opening a different project while a generate/retry call
+  was still in flight would let the stale call's result silently overwrite
+  the new project's transcript/reels once it finally resolved. This is the
+  same bug class as the "opening a new project didn't reset state" issue
+  fixed earlier — now both calls snapshot the project they belong to and
+  discard their result if a different project is open by the time they
+  resolve.
+- `desktop/src/main/export.js`, `desktop/src/main/sync.js`: error messages
+  surfaced to the user were truncated to the last 400 chars of ffmpeg/python
+  stderr, which for filter-graph failures often cuts off the actual cause in
+  favor of a generic tail line. Raised to 1200 chars (matching media.cjs's
+  own internal truncation).
+
+Restarted the backend and relaunched the desktop app to pick up all of the
+above.
+
+---
+
+## 2026-07-10 — Single-speaker enforcement (found a major loophole), look-ahead endings, tiered length priority
+
+Three requests: (1) reels should only ever contain the main speaker — no
+interviewer, employee, spouse, or friend's voice; (2) endings should
+explicitly look at the next sentence to decide whether to extend or retreat,
+rather than just stopping wherever; (3) 45-90s as first priority, 30-110s as
+a lower-priority fallback (still not a hard rule).
+
+**Found the real loophole for #1:** `format_segments_for_claude()`
+(`src/transcript_segments.py`) never included speaker identity in the text
+shown to Claude — segments looked like `[id] start=X end=Y "text"` with no
+speaker field at all. Claude was never given a way to tell who said what, so
+it had no mechanism to follow a "main speaker only" rule even if told to —
+every fix aimed at multi-speaker issues until now only patched the mechanical
+cutter layer, not the root cause of Claude's own selection being speaker-blind.
+Also found `speaker_prompt_summary()` (`src/transcription.py`) — a function
+that computes per-speaker word share — was written but never called anywhere.
+
+**Fix:**
+- `format_segments_for_claude()` now includes `speaker=<n>` per segment line.
+- New `_identify_main_speaker()` (`src/analyzer.py`) picks the speaker with
+  the most total speaking TIME across segments — the presumed documentary
+  subject.
+- New `# ONE SPEAKER ONLY` hard rule in `ANALYZER_PROMPT`, with the actual
+  identified speaker id substituted in (`{{MAIN_SPEAKER_ID}}`) so it's
+  concrete, not abstract — explicitly telling Claude to check the `speaker=`
+  field before selecting any segment, and that everyone else (interviewer,
+  other interviewees, reactions) is excluded except genuine voice-over
+  narration (which essentially never applies here).
+- Mechanical safety net in `_normalize_cut_sheets`: after Claude returns
+  segment ids, any id belonging to a different speaker than the identified
+  main subject gets dropped before the cut sheet is built — guarantees
+  compliance even if Claude's selection imperfectly follows the prompt (only
+  applied if it leaves at least one segment, so an imperfect reel doesn't
+  become an empty one).
+
+**Fix for #2 (look-ahead endings):** added an explicit "THE LOOK-AHEAD CHECK"
+procedure to the "END ON A LANDED BEAT" rule: before finalizing a reel, check
+the next segment (same speaker) — if it resolves the thought, extend into it;
+if it doesn't, don't end on the borderline segment either, retreat to the
+last segment that was already a clean, fully landed thought. Frames ending
+choice as a deliberate check, not a default stop-here.
+
+**Fix for #3 (tiered length priority):** `REEL_FLOOR_TOLERANCE_SECONDS = 15.0`
+added in `src/cutter.py`, separate from the ceiling's `REEL_END_TOLERANCE_SECONDS = 20.0`
+— asymmetric on purpose (45-15=30 vs 90+20=110, matching the user's exact
+numbers). `_length_rule()` rewritten to state an explicit priority order:
+45-90s first priority, 30-110s second priority ("reach for it only when
+45-90s truly isn't enough"), rather than presenting both ranges as equally
+casual. `_normalize_cut_sheets`'s floor-extension trigger (`soft_min`) now
+uses the new floor-specific tolerance instead of reusing the ceiling one.
+
+**Verified:** `_identify_main_speaker` correctly picked the dominant speaker
+in a synthetic 2-speaker transcript; the mechanical filter correctly dropped
+an interviewer's segments from a mixed-speaker selection while keeping the
+main speaker's, producing a valid 3-row cut sheet from only the correct
+speaker's content (first attempt showed an empty result — traced to empty
+test word data breaking downstream row-resolution, not the filter itself;
+confirmed correct once realistic word data was used); full prompt
+placeholder substitution confirmed clean end-to-end, including the new
+`{{MAIN_SPEAKER_ID}}` token resolving correctly; legacy `_extract_reels()`
+wrapper (which doesn't pass segments) confirmed to degrade safely rather than
+crash. All new section headers confirmed to appear exactly once. Backend
+restarted with everything loaded.
+
+---
+
+## 2026-07-09 — Target window raised to 45-90s
+
+User wanted reels landing bigger — too many were falling on the smaller end
+of the previous 30-90s window. Raised the floor: `REEL_MIN_SECONDS` 30→45 in
+`generate_reels.py`'s `DEFAULT_PROFILE` (`REEL_MAX_SECONDS` stays 90). Same
+"not a hard rule" philosophy as before — this is the one place both the CLI
+and the backend (`backend/app.py`'s `_run_selection` calls `apply_profile(DEFAULT_PROFILE)`
+before every selection) read from, and `_length_rule()`/the cutter's floor-extension
+math both pull `REEL_MIN_SECONDS`/`REEL_MAX_SECONDS` dynamically at call time,
+so this one change flows through the whole pipeline with nothing else to touch.
+
+New effective ranges: 45-90s primary target, 25-110s "equally normal" range
+(floor tolerance and ceiling unchanged at 20s), 110s hard ceiling unchanged.
+**Verified** by rendering `_length_rule()` with the new env values — correct
+numbers throughout (45-90s, 25-110s, 110s ceiling), and confirmed the
+floor-extension trigger (`soft_min`) recalculates to 25s automatically.
+Backend restarted with the change loaded.
+
+---
+
 ## 2026-07-02 — First-principles fix: the final trim step was the real culprit
 
 User reported "sudden endings" continuing even after the speaker-awareness

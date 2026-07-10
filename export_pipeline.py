@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -133,22 +134,63 @@ def export_reel_mp4(reel: dict, source: Path, out_path: Path) -> None:
         json.dump(payload, tmp, ensure_ascii=False)
         payload_path = tmp.name
     try:
-        proc = subprocess.run(
-            ["node", str(CLI), str(source), payload_path, str(out_path)],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=_export_timeout_seconds(reel),
-        )
+        _run_export_cli(source, payload_path, out_path, timeout=_export_timeout_seconds(reel))
     finally:
         Path(payload_path).unlink(missing_ok=True)
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or "export failed").strip()[:800])
-    if not out_path.is_file() or out_path.stat().st_size < 20_000:
-        raise RuntimeError(f"Export too small or missing: {out_path}")
 
 
 QUALITY_BITRATE = {"low": "10M", "medium": "16M", "high": "24M"}
+
+# A "too small/missing" output is usually transient resource contention, not a
+# real data problem: exporting many reels concurrently means several ffmpeg
+# processes seek into the SAME (possibly very large, e.g. 90+ minute) source
+# file at once — seen live producing a valid-but-empty MP4 container (0 media
+# frames, exit code 0) for a handful of reels out of a 15-reel batch while
+# the rest exported fine. A same-payload retry after the concurrent batch has
+# thinned out usually succeeds without any real change.
+_EXPORT_RETRY_ATTEMPTS = 2
+
+
+def _run_export_cli(source: Path, payload_path: str, out_path: Path, *, timeout: int) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, _EXPORT_RETRY_ATTEMPTS + 1):
+        try:
+            proc = subprocess.run(
+                ["node", str(CLI), str(source), payload_path, str(out_path)],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A retry attempt landing on a genuinely slow/contended moment
+            # (many concurrent exports fighting over the same large source
+            # file) can itself time out. Without catching this, a single
+            # slow retry crashed the ENTIRE batch export uncaught — even
+            # when every other reel, including this one's own first
+            # attempt, had already succeeded.
+            last_error = RuntimeError(f"Export timed out after {timeout}s: {exc}")
+            if attempt < _EXPORT_RETRY_ATTEMPTS:
+                time.sleep(2.0 * attempt)
+            continue
+        if proc.returncode != 0:
+            last_error = RuntimeError((proc.stderr or proc.stdout or "export failed").strip()[:800])
+        elif not out_path.is_file() or out_path.stat().st_size < 20_000:
+            # Re-check once after a brief pause before treating this as a
+            # real failure — ffmpeg had already exited (proc.returncode==0)
+            # so the data is written, but a slow filesystem flush on Windows
+            # can leave the size momentarily stale, which otherwise triggers
+            # an unnecessary (and costly) retry of an export that actually
+            # already succeeded.
+            time.sleep(0.5)
+            if out_path.is_file() and out_path.stat().st_size >= 20_000:
+                return
+            last_error = RuntimeError(f"Export too small or missing: {out_path}")
+        else:
+            return
+        if attempt < _EXPORT_RETRY_ATTEMPTS:
+            time.sleep(2.0 * attempt)
+    raise last_error  # type: ignore[misc]
 
 
 def export_reel_mp4_ex(reel: dict, source: Path, out_path: Path, options: dict) -> None:
@@ -214,23 +256,20 @@ def export_reel_mp4_ex(reel: dict, source: Path, out_path: Path, options: dict) 
         payload["musicPath"] = str(music["path"])
         payload["musicVolume"] = float(music.get("volume", 0.25))
 
+    # Optional end credits, appended after the reel content at export time only
+    # (see media.cjs exportReel) — the editor timeline/segments are never
+    # touched; it's purely a render-time concat driven by the export dialog.
+    end_credits_path = options.get("endCreditsPath")
+    if end_credits_path:
+        payload["endCreditsPath"] = str(end_credits_path)
+
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
         json.dump(payload, tmp, ensure_ascii=False)
         payload_path = tmp.name
     try:
-        proc = subprocess.run(
-            ["node", str(CLI), str(source), payload_path, str(out_path)],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=_export_timeout_seconds(reel),
-        )
+        _run_export_cli(source, payload_path, out_path, timeout=_export_timeout_seconds(reel))
     finally:
         Path(payload_path).unlink(missing_ok=True)
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or "export failed").strip()[:800])
-    if not out_path.is_file() or out_path.stat().st_size < 20_000:
-        raise RuntimeError(f"Export too small or missing: {out_path}")
 
 
 def export_all_reels(
@@ -248,7 +287,12 @@ def export_all_reels(
     if not reels:
         raise RuntimeError("No reels in analysis")
 
-    stem = re.sub(r"[^a-zA-Z0-9]+", "", video_stem.split("_")[1] if "_" in video_stem else video_stem) or "reels"
+    # `video_stem` is always the source video's own filename stem (see callers
+    # in generate_reels.py) — never a "jobid_name" pair — so splitting on "_"
+    # and keeping only the second token silently discarded most of the real
+    # filename for any source with an underscore in its name (e.g.
+    # "Jane_Doe_Interview.mp4" produced the doc/zip stem "Doe").
+    stem = re.sub(r"[^a-zA-Z0-9]+", "", video_stem) or "reels"
 
     def _export_one(reel: dict) -> Path:
         reel_id = int(reel.get("id") or 0)

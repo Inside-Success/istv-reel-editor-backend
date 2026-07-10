@@ -8,7 +8,9 @@ from anthropic import Anthropic
 from src.transcription import fmt_time
 from src.cutter import (
     MAX_REEL_SECONDS,
+    NEXT_WORD_GUARD_SEC,
     REEL_END_TOLERANCE_SECONDS,
+    REEL_FLOOR_TOLERANCE_SECONDS,
     build_reel_cut_sheet,
     extract_reel_segment_ids,
     normalize_order_mode,
@@ -16,6 +18,7 @@ from src.cutter import (
     reel_max_seconds,
     reel_min_seconds,
     resolve_brand_row_bounds,
+    _segment_text_dangles,
 )
 from src.transcript_segments import build_sentence_segments, format_segments_for_claude
 from src.transcript_snippets import verbatim_from_words
@@ -46,6 +49,17 @@ MAX_REEL_DURATION = MAX_REEL_SECONDS
 # against the public APIStatusError base class catches all of them, present
 # and future, without depending on SDK internals.
 _RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
+
+# Bounds a stalled streaming response (connection opens, then no bytes ever
+# arrive) so it surfaces as `APITimeoutError` — retryable via
+# `_is_retryable_claude_error` above — instead of hanging indefinitely. Found
+# live: a reel-selection call over a long transcript stalled for 25+ minutes
+# with the process still alive and no error, which from the app's
+# perspective looks like the pipeline being permanently stuck with no
+# recourse short of restarting the backend. 10 minutes is well above any
+# real generation time at max_tokens=12000, so this only ever fires on an
+# actual stall.
+_CLAUDE_CLIENT_TIMEOUT_SECONDS = 600.0
 
 
 def _is_retryable_claude_error(exc: Exception) -> bool:
@@ -117,13 +131,16 @@ ANALYZER_PROMPT = """You are a Social Media Strategist, Growth Marketer, and Con
 
 # Input
 The transcript (in the user message) is pre-split into numbered SENTENCE segments:
-[id] start=<sec.dec> end=<sec.dec> "one full sentence, verbatim"
-You SELECT WHOLE SEGMENTS BY ID, in playback order. You never invent timestamps and never start or end inside a segment. Times are resolved downstream from the ids you choose.
+[id] start=<sec.dec> end=<sec.dec> speaker=<n> "one full sentence, verbatim"
+You SELECT WHOLE SEGMENTS BY ID, in playback order. You never invent timestamps and never start or end inside a segment. Times are resolved downstream from the ids you choose. The speaker field tells you who said each segment — see the ONE SPEAKER ONLY rule below; this is not decorative, you must actually use it.
 
 # Who these reels are for
 ISTV is an interview-documentary company. This subject is a PAYING CLIENT — a founder, entrepreneur, lawyer, doctor, woman entrepreneur, veteran-turned-CEO, or similar professional — and THEY will post these reels to THEIR OWN social accounts. The reels are this person's personal brand, not generic clips. Two consequences:
 - Every reel must be something the subject would be PROUD to attach their name to and share: it should make them look credible, human, and worth following.
 - Across the set, a viewer should come away understanding both WHO this person is (their story, values) AND WHAT they do (their company, work, or field). Aim for at least a few reels that touch on their business or work — drawn only from what they actually said, never invented.
+
+# ONE SPEAKER ONLY (hard rule)
+Speaker {{MAIN_SPEAKER_ID}} is the main subject — identified as whoever talks the most across the transcript. EVERY segment in EVERY reel must be Speaker {{MAIN_SPEAKER_ID}}'s own words. Never select a segment from any other speaker: not the interviewer's questions, not another interviewee's answer (an employee, spouse, friend, colleague, or anyone else who appears in this transcript), not a reaction or interjection from someone else — even if it seems to bridge, resolve, or add color to the story. Check the "speaker=" field on every segment id before selecting it. The only exception is genuine voice-over narration read over unrelated visual footage (not another person answering their own question) — which essentially never appears in an interview transcript like this one; when in doubt, exclude the other speaker's segment.
 
 # Brand / promotional reels (required, every run)
 Reserve exactly 1-2 of the {{NUM_REELS}} reels as BRAND/PROMOTIONAL reels — content the client can keep and post specifically to promote their business, not just their personal story. Build these from segments where the subject talks about their company, product, service, offer, clients, or mission: what they do, who they help, what makes them different, results they've delivered. They should still open with a real hook and land cleanly like every other reel — the difference is WHAT they're about, not a lower bar. Mark these by setting "is_brand_reel": true in the JSON (every other reel: false). If the transcript genuinely contains little-to-no direct talk about the business/work, pick the 1-2 reels that come closest and still mark them true — never invent business details that were never said.
@@ -147,7 +164,8 @@ Vulnerability is NOT disqualifying — a struggle, a low point, a moment they al
 - OPEN ON A SELF-CONTAINED HOOK: the first segment must stop a thumb — a bold claim, question, number, or stake — AND must NOT depend on an earlier, un-included sentence. Never open on an unresolved reference: a bare pronoun ("She did it...", "They told me...", "He left...", "It changed everything..."), a demonstrative ("This was the moment...", "That's when..."), or a connector ("And so...", "But then...", "Because of that..."). The subject must be introduced by name, role, or clear noun WITHIN the reel. If the hook references something set up earlier, INCLUDE that setup segment so the context is resolved inside the reel. Never open on filler/continuation ("for a very long time I mean...", "After like three maybe..."). If a later line is a stronger opener, lead with it (cold-open) and set "order_mode":"hook_pull" — it must still be understandable with zero prior context.
 - END ON A LANDED BEAT (this outranks every other rule, including length): the last segment MUST end on a FULLY finished thought the speaker has delivered — the viewer should feel the idea is complete and nothing is left hanging, NOT that the speaker was about to say more. Never end mid-phrase, while the voice is still rising, on a connective ("and/but/so/that/or"), or on dangling setup ("I felt", "she was", "into my", "a lot of that", "to scope it"). If the thought finishes in the following segment (even one trailing word like "career" after "into my"), INCLUDE that segment so the reel resolves — it is far better to run well past the target length than to cut a beat early. When you're unsure whether a candidate ending is complete, resolve the doubt by extending, not by cutting. The reel must END on closure, not a hard cut that sounds like the sentence kept going — an abrupt ending makes the whole reel unusable no matter how strong the rest of it is.
   GRAMMATICALLY COMPLETE IS NOT THE SAME AS STORY COMPLETE: a sentence can be a full, correctly-punctuated sentence and still leave the STORY unresolved. If the last segment says something happened, changed, was decided, or was realized — WITHOUT actually revealing what it was — that is still building, not landed, even though the sentence itself is grammatically finished (e.g. "and that's the moment everything changed" tells the viewer a change happened but not what it was; "so I made a decision right then" names a decision but not what it was). Keep including segments until the actual content of that outcome is on-screen, not just the announcement that an outcome occurred.
-  MULTI-SPEAKER ENDINGS: if a different speaker's line falls at or near the end of the reel (a reaction, interjection, laugh, or half-sentence cutting in on the previous speaker), that is NOT a landed beat by default. Either (a) that speaker's contribution is itself a real, complete, meaningful line — include enough of it that it resolves on its own, or (b) it isn't — in which case end the reel on the PREVIOUS speaker's last landed line instead and drop the interjection entirely. Never let a reel trail off on someone else's half-reaction just because it happened to come next chronologically.
+  MULTI-SPEAKER ENDINGS: if a different speaker's line falls at or near the end of the reel (a reaction, interjection, laugh, or half-sentence cutting in on the previous speaker), that is NOT a landed beat by default — and per ONE SPEAKER ONLY above, you should not have selected it in the first place. Either (a) that speaker's contribution is itself a real, complete, meaningful line — include enough of it that it resolves on its own, or (b) it isn't — in which case end the reel on the PREVIOUS speaker's last landed line instead and drop the interjection entirely. Never let a reel trail off on someone else's half-reaction just because it happened to come next chronologically.
+  THE LOOK-AHEAD CHECK (do this explicitly for every reel before finalizing it): take the segment you're about to end on and read the NEXT segment in the transcript (same speaker only, per ONE SPEAKER ONLY). Ask: does that next segment complete or resolve the thought? If YES — include it, extend the reel to end there instead. If NO — the next segment starts a new thought, changes topic, or is itself incomplete — then do NOT end on your original candidate either if it was borderline; instead walk BACKWARD to the last segment that was already a clean, fully landed thought, and end there. Never leave the final segment as a coin-flip guess — always explicitly check one segment ahead, then either extend into it or retreat to the last segment you were already confident about. A reel should never simply stop because a segment id was reached; it should stop because that is where the thought actually finished.
 - BLEND if it helps: you may stitch up to ~5 non-contiguous segments into one reel if they genuinely connect and flow when spoken aloud.
 - {{LENGTH_RULE}}
 - NO FILLER at the edges ("um/uh/you know/and and").
@@ -216,31 +234,34 @@ def _profile_is_v2() -> bool:
 def _length_rule() -> str:
     """Build the LENGTH guidance line from the active duration window (env-configurable).
 
-    Completeness-first: a finished thought + full context always beats hitting the
-    window. {lo}-{hi}s is where most reels should land, but the full {lo-flex}-{hi+flex}s
-    range is presented as EQUALLY NORMAL (not a rare exception) — because the cutter
-    (src/cutter.py) enforces {hi+flex}s as a hard mechanical ceiling: if Claude picks
-    segment ids that run past it, the cutter trims from the end to fit, which can lop
-    the resolving/payoff segment right back off regardless of how good the selection
-    was. So Claude needs to self-limit to that real ceiling, not just be told "the
-    window is flexible" in the abstract — otherwise the truncation happens anyway,
-    just mechanically instead of by prompt.
+    Asymmetric, TIERED priority (not one flat "anything goes" range):
+      1st priority: {lo}-{hi}s (defaults 45-90s)
+      2nd priority (only if the story genuinely demands it): {floor}-{ceiling}s
+        (defaults 30-110s — floor tolerance is smaller than ceiling tolerance,
+        REEL_FLOOR_TOLERANCE_SECONDS=15 vs REEL_END_TOLERANCE_SECONDS=20)
+    {ceiling}s is also a REAL hard mechanical ceiling enforced by the cutter
+    (src/cutter.py) — segment ids past it get trimmed off the end regardless of
+    content, so Claude needs to self-limit to it, not just be told the window
+    is flexible in the abstract.
     """
     lo = int(round(reel_min_seconds()))
     hi = int(round(reel_max_seconds()))
-    flex = int(round(REEL_END_TOLERANCE_SECONDS))
-    ceiling = hi + flex
-    floor = max(1, lo - flex)
+    floor_flex = int(round(REEL_FLOOR_TOLERANCE_SECONDS))
+    ceiling_flex = int(round(REEL_END_TOLERANCE_SECONDS))
+    ceiling = hi + ceiling_flex
+    floor = max(1, lo - floor_flex)
     return (
         f"LENGTH: an abrupt ending, or a story that's still building with no resolution, is a "
         f"FAILED reel, full stop — no score is high enough to excuse it. Completing the thought "
-        f"matters more than hitting a number. {lo}-{hi}s is where most reels should land, but "
-        f"{floor}-{ceiling}s is EQUALLY NORMAL, ordinary range — not a rare exception, not something "
-        f"to reach for only when desperate. Neither {lo}s nor {hi}s is a strict requirement — these are "
-        f"illustrations of a principle, not target numbers to hit: a reel that completes its story "
-        f"somewhat under {lo}s is DONE, full stop — do not extend it just to approach {lo}s. A reel that "
-        f"genuinely needs somewhat more than {hi}s to properly resolve is equally fine. Freely use any "
-        f"part of {floor}-{ceiling}s whenever the story calls for it. "
+        f"matters more than hitting a number — but there IS a priority order to the window: "
+        f"{lo}-{hi}s is the FIRST PRIORITY, the range most reels should land in. Only if the story "
+        f"genuinely demands more or less room, {floor}-{ceiling}s is the second-priority, still-fine "
+        f"range — not a rare exception, but lower priority than {lo}-{hi}s, so reach for it only when "
+        f"{lo}-{hi}s truly isn't enough to land the thought cleanly. Neither {lo}s nor {hi}s is a strict "
+        f"requirement — these are illustrations of a principle, not target numbers to hit: a reel that "
+        f"completes its story somewhat under {lo}s is DONE, full stop — do not extend it just to "
+        f"approach {lo}s. A reel that genuinely needs somewhat more than {hi}s to properly resolve is "
+        f"equally fine. "
         f"The ONE hard number that matters: {ceiling}s is the true ceiling — segments beyond it get "
         f"mechanically trimmed off the end regardless of what they contain, which can chop off the "
         f"very resolution you were building toward. So budget for this yourself: if finishing the "
@@ -269,22 +290,29 @@ def analyze_with_claude(
     *,
     num_reels: int = DEFAULT_NUM_REELS,
     story_mode: bool = False,
+    raw_response_cb=None,
 ) -> dict:
     """
     Claude reel selection from segmented transcript + optional brand story.
     Returns analysis with editor_cut_sheet per reel and word timestamps attached.
+
+    `raw_response_cb`, if given, is forwarded to `select_reels()` and receives
+    Claude's exact raw response text (before any JSON parsing) — for archiving
+    what was actually said on each attempt, independent of the parsed result.
     """
     if num_reels not in VALID_NUM_REELS:
         num_reels = DEFAULT_NUM_REELS
 
-    client = Anthropic(api_key=api_key)
+    client = Anthropic(api_key=api_key, timeout=_CLAUDE_CLIENT_TIMEOUT_SECONDS)
     words = normalize_word_timings(transcript.get("words") or [])
     transcript = {**transcript, "words": words}
     segments = build_sentence_segments(words, float(transcript.get("duration") or 0))
     segmented_text = format_segments_for_claude(segments)
     duration = fmt_time(transcript["duration"])
+    main_speaker_id = _identify_main_speaker(segments)
 
     _log(progress_cb, f"Built {len(segments)} sentence segments from {len(words):,} words")
+    _log(progress_cb, f"Main speaker identified: Speaker {main_speaker_id}")
     mode_label = "ON (4-5 part series)" if story_mode else "OFF (all standalone)"
     _log(progress_cb, f"Story mode {mode_label}")
     _log(progress_cb, f"Selecting {num_reels} reels with Claude ({model})...")
@@ -296,6 +324,8 @@ def analyze_with_claude(
             model=model,
             client=client,
             segmented_text=segmented_text,
+            main_speaker_id=main_speaker_id,
+            raw_response_cb=raw_response_cb,
         ),
         progress_cb=progress_cb,
         label="Reel selection",
@@ -333,6 +363,7 @@ def analyze_with_claude(
         segments,
         float(transcript.get("duration") or 0),
         story_mode=story_mode,
+        main_speaker_id=main_speaker_id,
     )
 
     _log(progress_cb, "Filling verbatim transcript text for each cut window...")
@@ -353,24 +384,35 @@ def select_reels(
     client: Anthropic | None = None,
     segmented_text: str | None = None,
     api_key: str | None = None,
+    main_speaker_id: int | None = None,
+    raw_response_cb=None,
 ) -> dict:
-    """Call Claude with the marketing-package analyzer prompt."""
+    """Call Claude with the marketing-package analyzer prompt.
+
+    `raw_response_cb`, if given, receives the exact raw response text before
+    JSON parsing/cleanup — lets a caller archive what Claude actually said,
+    independent of how `_parse_json_object` interprets it.
+    """
     if num_reels not in VALID_NUM_REELS:
         num_reels = DEFAULT_NUM_REELS
 
     if client is None:
         if not api_key:
             raise ValueError("api_key or client required for select_reels")
-        client = Anthropic(api_key=api_key)
+        client = Anthropic(api_key=api_key, timeout=_CLAUDE_CLIENT_TIMEOUT_SECONDS)
 
     if segmented_text is None:
         segmented_text = format_segments_for_claude(segments)
+
+    if main_speaker_id is None:
+        main_speaker_id = _identify_main_speaker(segments)
 
     block = STORY_ON_BLOCK if story_mode else STORY_OFF_BLOCK
     system = (
         ANALYZER_PROMPT.replace("{{STORY_MODE_BLOCK}}", block.replace("{{NUM_REELS}}", str(num_reels)))
         .replace("{{ISTV_ACCOUNTS}}", ISTV_ACCOUNTS)
         .replace("{{LENGTH_RULE}}", _length_rule())
+        .replace("{{MAIN_SPEAKER_ID}}", str(main_speaker_id))
         .replace("{{NUM_REELS}}", str(num_reels))
     )
     if _profile_is_v2():
@@ -383,6 +425,9 @@ def select_reels(
         messages=[{"role": "user", "content": segmented_text}],
     ) as stream:
         full_text = stream.get_final_text()
+
+    if raw_response_cb:
+        raw_response_cb(full_text)
 
     text = full_text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -746,6 +791,7 @@ def _maybe_extend_playback_rows(
     min_total: float,
     transcript_end: float,
     utterance_segments: list[dict] | None = None,
+    main_speaker_id: int | None = None,
 ) -> list[dict]:
     """Extend a too-short single-segment reel up to the minimum duration.
 
@@ -757,6 +803,16 @@ def _maybe_extend_playback_rows(
     than a real completed thought. Sentence segments are already boundary-safe
     by construction (see build_sentence_segments), so walking forward through
     them one at a time guarantees the extension never splits a word/sentence.
+
+    Never extends past the start of a different speaker's segment. This
+    function mutates the ROW's end_time_seconds directly by walking forward
+    through time — it never touches `reel["segment_ids"]` and runs AFTER the
+    mechanical single-speaker filter in `_normalize_cut_sheets`, so without
+    this check it would silently pad straight through (or land the tail
+    inside) a foreign speaker's segment purely because it was next
+    chronologically, completely undoing that filter for any reel under the
+    length floor — found live via real-footage testing: `segment_ids` looked
+    correctly single-speaker while the actual rendered clip wasn't.
     """
     if not rows or transcript_end <= 0:
         return rows
@@ -766,30 +822,91 @@ def _maybe_extend_playback_rows(
     last = rows[-1]
     b = _float_safe(last.get("end_time_seconds"))
 
+    ceiling = transcript_end
+    if utterance_segments and main_speaker_id is not None:
+        for seg in sorted(utterance_segments, key=lambda s: _float_safe(s.get("start"))):
+            if _float_safe(seg.get("start")) < b - 0.05:
+                continue
+            if int(seg.get("speaker", main_speaker_id) or main_speaker_id) != main_speaker_id:
+                # Guard below the foreign segment's actual start, not exactly
+                # at it — a same-speaker segment can end with ZERO gap before
+                # a different speaker's segment (a real interruption/overlap
+                # in the source audio, seen live: speaker A trails off with
+                # no pause and speaker B talks over them). Landing the row's
+                # end_time_seconds exactly on that boundary let the foreign
+                # speaker's first word slip into `timestamped_words` anyway,
+                # since `_attach_words`'s inclusion check is `ws > end`
+                # (inclusive of an exact tie) — this keeps a real gap so that
+                # check reliably excludes it.
+                ceiling = min(ceiling, _float_safe(seg.get("start")) - NEXT_WORD_GUARD_SEC)
+                break
+
     if utterance_segments:
         candidates = sorted(
-            (s for s in utterance_segments if _float_safe(s.get("start")) >= b - 0.05),
+            (
+                s for s in utterance_segments
+                if _float_safe(s.get("start")) >= b - 0.05 and _float_safe(s.get("start")) < ceiling - 0.01
+            ),
             key=lambda s: _float_safe(s.get("start")),
         )
         new_end = b
+        last_clean_end = b  # best boundary seen so far that ends cleanly
+        deficit_met = False
         for seg in candidates:
             seg_end = _float_safe(seg.get("end"))
             if seg_end <= new_end + 0.01:
                 continue
-            new_end = min(seg_end, transcript_end)
-            if new_end - b >= deficit - 0.02:
+            new_end = min(seg_end, ceiling)
+            if not deficit_met and new_end - b >= deficit - 0.02:
+                deficit_met = True
+            # Once the numeric floor is satisfied, keep walking through
+            # whole same-speaker segments until landing on one that actually
+            # ends cleanly — otherwise this stops the instant the deficit
+            # math clears, with zero regard for whether that segment's own
+            # text is a landed thought. That's how a reel ended on "...give
+            # me a male's mentality," (a comma mid-list) instead of the very
+            # next segment, "but a woman's fortitude." — a segment that was
+            # already same-speaker and well within budget. Same principle as
+            # cutter.py's tail-extension: run past the target length rather
+            # than cut a beat early.
+            clean = not _segment_text_dangles(str(seg.get("text") or ""))
+            if clean:
+                last_clean_end = new_end
+            if deficit_met and clean:
                 break
+        else:
+            # Ran out of same-speaker candidates (hit the ceiling) without
+            # ever landing on a clean ending past the deficit — e.g. the
+            # speaker trails off right as a different speaker interrupts,
+            # with no room left to extend into. Fall back to the best clean
+            # boundary seen (possibly `b` itself, i.e. no extension at all)
+            # rather than accept a dangling ending just to hit the floor —
+            # `b` is already guaranteed clean, since this function only runs
+            # on rows that already passed through cutter.py's
+            # `_trim_dangling_tail_ids` as the last step before this.
+            new_end = last_clean_end
         if new_end > b + 0.01:
             last["end_time_seconds"] = new_end
             return rows
-        # No sentence segments available to extend into (e.g. this is already
-        # the last segment in the transcript) — fall through to raw-second
-        # padding below rather than leaving the reel under the floor.
+        if candidates:
+            # There WAS same-speaker material to consider, but none of it
+            # ended cleanly (the `else` branch above already tried and
+            # fell back to `b`) — don't drop down to raw-second padding
+            # in that case, since it has no completeness check at all and
+            # would happily undo this decision by padding mid-sentence
+            # through the exact same dangling material. Better to stay
+            # under the floor than fabricate a worse ending.
+            return rows
+        # No same-speaker sentence segments available to extend into at all
+        # (e.g. this is already the last segment in the transcript, or a
+        # different speaker starts immediately) — fall through to raw-second
+        # padding below, still bounded by `ceiling`, rather than leaving the
+        # reel under the floor.
 
-    room = transcript_end - b
+    room = ceiling - b
     if room <= 0.02:
         return rows
-    last["end_time_seconds"] = min(b + deficit, b + room, transcript_end)
+    last["end_time_seconds"] = min(b + deficit, b + room, ceiling)
     if _float_safe(last.get("end_time_seconds")) <= b + 0.01:
         return rows
     return rows
@@ -847,6 +964,7 @@ def _normalize_cut_sheets(
     transcript_duration: float = 0.0,
     *,
     story_mode: bool = False,
+    main_speaker_id: int | None = None,
 ) -> None:
     """Build word-accurate cut sheets from v2 sentence segment picks."""
     tmax = max(0.0, float(transcript_duration or 0.0))
@@ -855,15 +973,31 @@ def _normalize_cut_sheets(
     max_dur = reel_max_seconds()
     min_dur = reel_min_seconds()
     soft_dur = max_dur + REEL_END_TOLERANCE_SECONDS
-    # Mirror the ceiling's tolerance on the floor side: a reel that already
-    # completes its story a bit under min_dur (e.g. 26s when the target is
-    # 30s) is fine as-is — only pad reels shorter than THIS toward min_dur,
+    # Asymmetric: floor tolerance is smaller than ceiling tolerance (15s vs
+    # 20s at defaults) — a reel that already completes its story a bit under
+    # min_dur is fine as-is; only pad reels shorter than THIS toward min_dur,
     # so a genuinely short-but-complete story doesn't get mechanically
     # stretched just to hit the target number.
-    soft_min = max(1.0, min_dur - REEL_END_TOLERANCE_SECONDS)
+    soft_min = max(1.0, min_dur - REEL_FLOOR_TOLERANCE_SECONDS)
+    seg_by_id = {int(s["id"]): s for s in utterance_segments if s.get("id") is not None}
+    if main_speaker_id is None:
+        main_speaker_id = _identify_main_speaker(utterance_segments)
 
     for reel in analysis.get("reels", []):
         order_mode = normalize_order_mode(reel.get("order_mode") or reel.get("assembly_mode"))
+
+        # Mechanical safety net for the "ONE SPEAKER ONLY" prompt rule: drop
+        # any segment id Claude picked that belongs to a different speaker
+        # than the identified main subject. Only applied if it leaves at
+        # least one segment — an imperfect reel beats an empty one.
+        raw_ids = extract_reel_segment_ids(reel)
+        if raw_ids:
+            same_speaker_ids = [
+                sid for sid in raw_ids
+                if seg_by_id.get(sid, {}).get("speaker", main_speaker_id) == main_speaker_id
+            ]
+            if same_speaker_ids:
+                reel["segment_ids"] = same_speaker_ids
 
         sheet = build_reel_cut_sheet(
             words,
@@ -925,7 +1059,9 @@ def _normalize_cut_sheets(
 
         sheet = _cap_playback_rows(sheet, soft_dur)
         if _playback_total_seconds(sheet) < soft_min and len(sheet) == 1 and tmax > 0:
-            sheet = _maybe_extend_playback_rows(sheet, min_dur, tmax, utterance_segments)
+            sheet = _maybe_extend_playback_rows(
+                sheet, min_dur, tmax, utterance_segments, main_speaker_id=main_speaker_id
+            )
             sheet = _cap_playback_rows(sheet, soft_dur)
 
         reel["segment_ids"] = extract_reel_segment_ids(reel) or extract_ids_from_sheet(sheet)
@@ -1083,7 +1219,19 @@ def _attach_words(analysis: dict, words: list) -> None:
                 for w in words:
                     ws = _float_safe(w.get("start"))
                     we = _float_safe(w.get("end"), ws)
-                    if we < start or ws > end:
+                    # Window is [start, end) — exclusive on BOTH sides, not
+                    # just the end. `ws >= end` excludes a word starting
+                    # exactly at the window's close (a same-speaker segment
+                    # ending with zero gap before a different speaker's
+                    # segment, seen live). `we <= start` (not `<`) excludes
+                    # the mirror case: a word ending exactly where THIS
+                    # window starts — happens when `_resolve_run`'s
+                    # lead-in padding clamps a row's start to exactly
+                    # `prev_word.end`, and that previous word belongs to a
+                    # DIFFERENT speaker's segment (also seen live: a
+                    # one-word foreign interjection right before a
+                    # same-speaker payoff span leaked in this way).
+                    if we <= start or ws >= end:
                         continue
                     collected.append(
                         {
@@ -1102,7 +1250,7 @@ def _attach_words(analysis: dict, words: list) -> None:
             for w in words:
                 ws = _float_safe(w.get("start"))
                 we = _float_safe(w.get("end"), ws)
-                if we < start or ws > end:
+                if we <= start or ws >= end:  # see boundary note above
                     continue
                 collected.append(
                     {
@@ -1162,3 +1310,19 @@ def _parse_json(text: str, expected_key: str):
 def _log(cb, msg: str):
     if cb:
         cb(msg)
+
+
+def _identify_main_speaker(segments: list[dict]) -> int:
+    """Speaker id with the most total speaking time — the presumed documentary
+    subject (the "main speaker"), as opposed to an interviewer, another
+    interviewee, a spouse, employee, or friend who also appears in the raw
+    transcript. Used both to tell Claude who to select from and as the basis
+    for the mechanical single-speaker filter in `_normalize_cut_sheets`."""
+    totals: dict[int, float] = {}
+    for seg in segments:
+        sp = int(seg.get("speaker", 0) or 0)
+        dur = max(0.0, float(seg.get("end") or 0) - float(seg.get("start") or 0))
+        totals[sp] = totals.get(sp, 0.0) + dur
+    if not totals:
+        return 0
+    return max(totals.items(), key=lambda kv: kv[1])[0]

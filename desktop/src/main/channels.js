@@ -16,6 +16,7 @@ module.exports = {
   PICK_EXPORT_DIR: "export:pick-dir",
   EXPORT_REELS: "export:run",
   EXPORT_EVENT: "export:event",
+  PICK_END_CREDITS: "export:pick-end-credits",
 
   PICK_REFERENCE_AUDIO: "cameras:pick-reference-audio",
   ADD_CAMERA_DIALOG: "cameras:add-camera-dialog",

@@ -27,6 +27,11 @@ _RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
 _CHUNK_RETRY_ATTEMPTS = 4
 _CHUNK_RETRY_DELAY = 2.0
 _CHUNK_RETRY_MAX_DELAY = 20.0
+# Bounds a stalled request so it surfaces as a retryable APITimeoutError
+# instead of hanging indefinitely — see the matching constant/comment in
+# src/analyzer.py. Chunks here are small (max_tokens=2000), so a much
+# shorter bound than the reel-selection call is still generous.
+_CLIENT_TIMEOUT_SECONDS = 120.0
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -79,7 +84,7 @@ def correct_transcript_words(
     if not words:
         return words, 0
 
-    client = Anthropic(api_key=api_key)
+    client = Anthropic(api_key=api_key, timeout=_CLIENT_TIMEOUT_SECONDS)
     out = [dict(w) for w in words]
     n = len(out)
     total_fixes = 0

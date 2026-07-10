@@ -112,11 +112,32 @@ def delete(job_id: str) -> None:
         _conn.commit()
 
 
+_IN_FLIGHT_STATUSES = {"queued", "transcribing", "selecting"}
+
+
 def purge_older_than(max_age_seconds: int = 86400) -> None:
-    """Drop finished/stale job rows so the table doesn't grow unbounded."""
+    """Drop finished/stale job rows so the table doesn't grow unbounded.
+
+    Never deletes a row whose status is still in-flight, no matter how old —
+    this used to run before `load_all()` in `_bootstrap_jobs`, so a job whose
+    `updated_at` hadn't ticked in 24h+ (backend down over a weekend, a crash
+    mid-run) would get silently deleted before it ever got a chance to be
+    resumed; the client polling it just saw a 404 with no explanation.
+    """
     with _lock:
-        _conn.execute(
-            "DELETE FROM jobs WHERE updated_at < strftime('%s','now') - ?",
+        rows = _conn.execute(
+            "SELECT job_id, data FROM jobs WHERE updated_at < strftime('%s','now') - ?",
             (max_age_seconds,),
-        )
-        _conn.commit()
+        ).fetchall()
+        stale_ids: list[str] = []
+        for job_id, data in rows:
+            try:
+                status = json.loads(data).get("status")
+            except json.JSONDecodeError:
+                stale_ids.append(job_id)  # corrupted row — load_all() would drop it anyway
+                continue
+            if status not in _IN_FLIGHT_STATUSES:
+                stale_ids.append(job_id)
+        if stale_ids:
+            _conn.executemany("DELETE FROM jobs WHERE job_id = ?", [(j,) for j in stale_ids])
+            _conn.commit()

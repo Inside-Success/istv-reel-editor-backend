@@ -187,11 +187,17 @@ def _format_time(seconds: float) -> str:
 
 
 def format_segments_for_claude(segments: list[dict]) -> str:
-    """[id] start=<sec.dec> end=<sec.dec> \"sentence text\""""
+    """[id] start=<sec.dec> end=<sec.dec> speaker=<n> \"sentence text\"
+
+    Speaker id is included so Claude can actually tell who said what — without
+    it, a "main speaker only" instruction has nothing to act on, since every
+    segment would look identical regardless of who's talking.
+    """
     lines: list[str] = []
     for seg in segments:
         text = str(seg.get("text") or "").replace('"', "'")
         start = _format_time(seg.get("start", 0.0))
         end = _format_time(seg.get("end", 0.0))
-        lines.append(f'[{seg["id"]}] start={start} end={end} "{text}"')
+        speaker = int(seg.get("speaker", 0) or 0)
+        lines.append(f'[{seg["id"]}] start={start} end={end} speaker={speaker} "{text}"')
     return "\n".join(lines)

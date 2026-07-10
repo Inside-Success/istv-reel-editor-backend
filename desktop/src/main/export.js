@@ -124,6 +124,13 @@ function exportReels({ srcPath, outDir, reels, dialog, cameras, onEvent }) {
         cameras.map((c) => [c.id, { path: c.path, offsetSec: Number(c.offsetSec) || 0 }]),
       );
     }
+    // End credits (optional, user's choice per export — see index.html Export
+    // dialog): appended after the reel content only in the rendered file,
+    // never touching the editor timeline. Omitted entirely unless the user
+    // both picked a file AND checked the box.
+    if (dialog.includeEndCredits && dialog.endCreditsPath) {
+      options.endCreditsPath = dialog.endCreditsPath;
+    }
     const spec = {
       source: srcPath,
       outDir,
@@ -185,7 +192,11 @@ function exportReels({ srcPath, outDir, reels, dialog, cameras, onEvent }) {
         resolve(outputs);
       } else {
         console.error(`[export] exited ${code}: ${stderr.trim().slice(-800)}`);
-        reject(new Error(stderr.trim().slice(-400) || `Exporter exited ${code}`));
+        // Long ffmpeg filter-graph errors often have the actual cause well
+        // before the last 400 chars (e.g. the "Conversion failed!" tail is
+        // generic) — 1200 chars keeps enough of the real diagnostic visible
+        // to the user instead of just the unhelpful last line.
+        reject(new Error(stderr.trim().slice(-1200) || `Exporter exited ${code}`));
       }
     });
   });
