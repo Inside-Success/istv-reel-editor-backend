@@ -45,7 +45,8 @@
       "target": "nsis"
     },
     "mac": {
-      "target": "dmg"
+      "target": "dmg",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
     }
   }
 }

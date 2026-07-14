@@ -9,7 +9,19 @@ on:
 
 jobs:
   build-mac:
-    runs-on: macos-latest
+    # Build each arch on a host of that same arch so ffmpeg-static/ffprobe-static
+    # (which download a single host-matched binary at `npm ci` time) end up with
+    # the CORRECT binary bundled. A single-arch DMG run on the other arch fails
+    # with macOS EBADARCH (-86, "Bad CPU type in executable") when it spawns ffmpeg.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13 # Intel host  -> x64 ffmpeg binary + x64 app
+            arch: x64
+          - runner: macos-14 # Apple Silicon host -> arm64 ffmpeg binary + arm64 app
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write # needed to create/update the GitHub Release
     defaults:
@@ -30,4 +42,4 @@ jobs:
       - name: Build and publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --mac --publish always
+        run: npx electron-builder --mac --${{ matrix.arch }} --publish always
