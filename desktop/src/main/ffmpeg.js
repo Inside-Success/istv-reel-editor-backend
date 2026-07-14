@@ -55,7 +55,20 @@ function run(bin, args, { onStderr } = {}) {
       stderr += s;
       if (onStderr) onStderr(s);
     });
-    child.on("error", reject);
+    child.on("error", (err) => {
+      // errno -86 on macOS is EBADARCH ("Bad CPU type in executable"): the
+      // bundled ffmpeg/ffprobe binary is built for a different CPU than this
+      // Mac. Surface an actionable message instead of "Unknown system error -86".
+      if (err && err.errno === -86) {
+        reject(new Error(
+          `${path.basename(bin)} was built for a different CPU architecture ` +
+          `than this Mac (running ${process.arch}). Install the matching build, ` +
+          `or run \`softwareupdate --install-rosetta\` as a stopgap.`
+        ));
+        return;
+      }
+      reject(err);
+    });
     child.on("close", (code) => {
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`${path.basename(bin)} exited ${code}: ${stderr.slice(-800)}`));
