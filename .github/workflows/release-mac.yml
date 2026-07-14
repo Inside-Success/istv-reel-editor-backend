@@ -20,6 +20,11 @@ jobs:
     # (-86, "Bad CPU type in executable") the moment it spawns ffmpeg.
     strategy:
       fail-fast: false
+      # Serialize the two arches: run concurrently and both electron-builder
+      # jobs race to CREATE the GitHub release, and the loser dies with
+      # HTTP 422 "already_exists". With max-parallel 1 the first job creates
+      # the release + uploads its DMG, and the second finds it and just uploads.
+      max-parallel: 1
       matrix:
         arch: [x64, arm64]
     runs-on: macos-14
