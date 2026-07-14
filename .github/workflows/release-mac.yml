@@ -9,19 +9,20 @@ on:
 
 jobs:
   build-mac:
-    # Build each arch on a host of that same arch so ffmpeg-static/ffprobe-static
-    # (which download a single host-matched binary at `npm ci` time) end up with
-    # the CORRECT binary bundled. A single-arch DMG run on the other arch fails
-    # with macOS EBADARCH (-86, "Bad CPU type in executable") when it spawns ffmpeg.
+    # Both arches build on the Apple Silicon runner. We can't rely on a native
+    # Intel host: the hosted macos-13 runner is retired and its jobs sit queued
+    # forever. Instead we cross-build:
+    #   - ffmpeg-static downloads its single binary from `npm_config_arch` at
+    #     install time, so we set it per matrix arch (see the install step).
+    #   - ffprobe-static already bundles every arch and resolves at runtime.
+    #   - electron-builder --<arch> fetches the matching Electron runtime.
+    # A single-arch ffmpeg on the wrong Mac fails with macOS EBADARCH
+    # (-86, "Bad CPU type in executable") the moment it spawns ffmpeg.
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-13 # Intel host  -> x64 ffmpeg binary + x64 app
-            arch: x64
-          - runner: macos-14 # Apple Silicon host -> arm64 ffmpeg binary + arm64 app
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
+        arch: [x64, arm64]
+    runs-on: macos-14
     permissions:
       contents: write # needed to create/update the GitHub Release
     defaults:
@@ -36,8 +37,12 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
-      - name: Install dependencies
+      - name: Install dependencies (fetch ${{ matrix.arch }} ffmpeg binary)
         run: npm ci
+        env:
+          # ffmpeg-static's install script reads this to pick which binary to
+          # download; without it we'd get the arm64 host binary for both DMGs.
+          npm_config_arch: ${{ matrix.arch }}
 
       - name: Build and publish to GitHub Releases
         env:
