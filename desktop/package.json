@@ -1,7 +1,7 @@
 {
   "name": "istv-reel-editor",
   "productName": "ISTV Reel Editor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cross-platform desktop editor that turns a documentary into 9:16 reels.",
   "main": "src/main/main.js",
   "author": "ISTV",
